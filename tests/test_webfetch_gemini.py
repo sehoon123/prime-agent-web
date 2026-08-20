@@ -148,19 +148,22 @@ class GenerateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inline["mimeType"], "application/pdf")
         self.assertEqual(base64.b64decode(inline["data"]), pdf)
 
-    async def test_oversized_pdf_is_refused_before_the_request(self) -> None:
+    async def test_oversized_pdf_is_never_inlined(self) -> None:
+        # Over the inline ceiling the Files API path is used instead; see
+        # test_webfetch_files.py for the upload protocol itself.
         patch_endpoints(self, CORP)
-        called = {"n": 0}
+        seen: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            called["n"] += 1
-            return httpx.Response(200, json=answer_payload("x"))
+            seen.append(str(request.url))
+            return httpx.Response(404, text="no files api here")
 
         async with client_for(handler) as client:
             with self.assertRaises(RuntimeError) as ctx:
                 await _gemini.read_pdf(client, b"%PDF-" + b"x" * _gemini.MAX_INLINE_BYTES)
         self.assertIn("inline limit", str(ctx.exception))
-        self.assertEqual(called["n"], 0)
+        self.assertTrue(all("generateContent" not in url for url in seen))
+        self.assertTrue(any("/upload/" in url for url in seen))
 
     async def test_key_and_endpoint_failover(self) -> None:
         dead = FakeEndpoint("dead", "https://dead.example.com/v1beta", ("m",), ("k-bad",))

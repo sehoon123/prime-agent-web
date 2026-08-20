@@ -23,7 +23,10 @@ from typing import Any, Optional, Sequence
 
 import httpx
 
-# Inline request payload ceiling for generateContent; larger PDFs need the Files API.
+from . import _files
+
+# Inline request payload ceiling for generateContent; larger PDFs go through the
+# Files API instead (see _files.py).
 MAX_INLINE_BYTES = 18 * 1024 * 1024
 FAILOVER_STATUSES = frozenset({401, 402, 403, 408, 409, 425, 429, 500, 502, 503, 504})
 
@@ -108,6 +111,60 @@ def _extract_text(payload: dict[str, Any]) -> tuple[str, list[str]]:
     return text, urls
 
 
+@dataclass
+class _Attempt:
+    """One endpoint/key attempt: exactly one of answer or failure is set."""
+
+    answer: Optional[GeminiAnswer] = None
+    failure: Optional[str] = None
+    retry_next_key: bool = True
+
+
+async def _call(
+    client: httpx.AsyncClient,
+    endpoint: Any,
+    key: str,
+    model_id: str,
+    body: dict[str, Any],
+    timeout: Optional[float],
+) -> _Attempt:
+    label = f"{endpoint.label}/{model_id}"
+    url = f"{endpoint.base_url}/models/{model_id}:generateContent"
+    try:
+        response = await client.post(
+            url,
+            headers={"x-goog-api-key": key, "content-type": "application/json"},
+            json=body,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as error:
+        return _Attempt(failure=f"{label}: {type(error).__name__}")
+
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                detail = str(payload["error"].get("message") or "")[:160]
+        except ValueError:
+            detail = response.text[:160]
+        return _Attempt(
+            failure=f"{label}: HTTP {response.status_code} {detail}".strip(),
+            # A 4xx that is not a credential or rate problem will repeat identically.
+            retry_next_key=response.status_code in FAILOVER_STATUSES,
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return _Attempt(failure=f"{label}: non-JSON response")
+
+    text, urls = _extract_text(payload)
+    if not text:
+        return _Attempt(failure=f"{label}: empty response")
+    return _Attempt(answer=GeminiAnswer(text=text, detail=label, retrieved_urls=urls))
+
+
 async def generate(
     client: httpx.AsyncClient,
     parts: list[dict[str, Any]],
@@ -135,45 +192,86 @@ async def generate(
         if not chosen:
             failures.append(f"{endpoint.label}: no usable model")
             continue
-        url = f"{endpoint.base_url}/models/{chosen}:generateContent"
         for key in endpoint.keys:
-            try:
-                response = await client.post(
-                    url,
-                    headers={"x-goog-api-key": key, "content-type": "application/json"},
-                    json=body,
-                    timeout=timeout,
-                )
-            except httpx.HTTPError as error:
-                failures.append(f"{endpoint.label}/{chosen}: {type(error).__name__}")
-                continue
-
-            if response.status_code >= 400:
-                detail = ""
-                try:
-                    error_payload = response.json()
-                    if isinstance(error_payload, dict) and isinstance(error_payload.get("error"), dict):
-                        detail = str(error_payload["error"].get("message") or "")[:160]
-                except ValueError:
-                    detail = response.text[:160]
-                failures.append(f"{endpoint.label}/{chosen}: HTTP {response.status_code} {detail}".strip())
-                if response.status_code in FAILOVER_STATUSES:
-                    continue
-                break  # a 400 will repeat with the same request shape
-
-            try:
-                payload = response.json()
-            except ValueError:
-                failures.append(f"{endpoint.label}/{chosen}: non-JSON response")
-                continue
-
-            text, urls = _extract_text(payload)
-            if not text:
-                failures.append(f"{endpoint.label}/{chosen}: empty response")
-                continue
-            return GeminiAnswer(text=text, detail=f"{endpoint.label}/{chosen}", retrieved_urls=urls)
+            attempt = await _call(client, endpoint, key, chosen, body, timeout)
+            if attempt.answer:
+                return attempt.answer
+            if attempt.failure:
+                failures.append(attempt.failure)
+            if not attempt.retry_next_key:
+                break
 
     raise RuntimeError("; ".join(failures) or "every Gemini endpoint failed")
+
+
+async def generate_with_upload(
+    client: httpx.AsyncClient,
+    content: bytes,
+    mime_type: str,
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    timeout: Optional[float] = None,
+    display_name: str = "webfetch-upload",
+) -> GeminiAnswer:
+    """Upload a payload too large to inline, then ask about it.
+
+    The file must be used on the endpoint it was uploaded to, so upload and call stay
+    paired here. Endpoints without a Files API are skipped, and the uploaded file is
+    deleted afterwards.
+    """
+    endpoints = _endpoints()
+    if not endpoints:
+        raise GeminiUnavailable(UNAVAILABLE)
+
+    failures: list[str] = []
+    for endpoint in endpoints:
+        chosen = endpoint.pick_model(model)
+        if not chosen:
+            failures.append(f"{endpoint.label}: no usable model")
+            continue
+        for key in endpoint.keys:
+            try:
+                uploaded = await _files.upload(
+                    client,
+                    endpoint.base_url,
+                    key,
+                    content,
+                    mime_type,
+                    display_name=display_name,
+                    timeout=timeout,
+                )
+            except _files.FilesApiUnsupported as error:
+                failures.append(f"{endpoint.label}: {error}")
+                break  # the whole endpoint lacks it; other keys will not help
+            except RuntimeError as error:
+                failures.append(f"{endpoint.label}: {error}")
+                continue
+
+            body = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"fileData": {"mimeType": uploaded.mime_type, "fileUri": uploaded.uri}},
+                            {"text": prompt.strip()},
+                        ],
+                    }
+                ]
+            }
+            try:
+                attempt = await _call(client, endpoint, key, chosen, body, timeout)
+            finally:
+                await _files.delete(client, endpoint.base_url, key, uploaded.name, timeout=timeout)
+
+            if attempt.answer:
+                return attempt.answer
+            if attempt.failure:
+                failures.append(attempt.failure)
+            if not attempt.retry_next_key:
+                break
+
+    raise RuntimeError("; ".join(failures) or "no endpoint could accept an uploaded file")
 
 
 async def answer_about_url(
@@ -217,10 +315,25 @@ async def read_pdf(
 ) -> GeminiAnswer:
     """Read a PDF whose text layer is missing or unusable (scans, figures)."""
     if len(content) > MAX_INLINE_BYTES:
-        raise RuntimeError(
-            f"PDF is {len(content):,} bytes, over the {MAX_INLINE_BYTES:,}-byte inline limit "
-            "for model extraction; pass max_pages or extract locally"
-        )
+        # Too large to inline: upload it, unless no endpoint exposes the Files API.
+        try:
+            return await generate_with_upload(
+                client,
+                content,
+                "application/pdf",
+                prompt or DEFAULT_PDF_PROMPT,
+                model=model,
+                timeout=timeout,
+                display_name="webfetch-pdf",
+            )
+        except GeminiUnavailable:
+            raise
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"PDF is {len(content):,} bytes, over the {MAX_INLINE_BYTES:,}-byte inline limit, "
+                f"and uploading it failed: {error}. Pass max_pages to shrink it, or read it "
+                "locally with gemini=False if it has a text layer."
+            ) from error
     parts = [
         {"inlineData": {"mimeType": "application/pdf", "data": base64.b64encode(content).decode("ascii")}},
         {"text": (prompt or DEFAULT_PDF_PROMPT).strip()},

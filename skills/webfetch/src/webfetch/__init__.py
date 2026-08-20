@@ -45,7 +45,7 @@ from ._safety import (
 )
 
 __all__ = ["run", "fetch", "Document", "FetchError", "UnsafeUrlError", "TooLargeError", "gemini_available"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 MODES = ("markdown", "text", "raw")
 DEFAULT_MAX_CHARS = 20_000

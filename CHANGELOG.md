@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-20
+
+### Added
+
+- Gemini **Files API** support for payloads over the ~18 MB inline request limit.
+  `generateContent` carries inline data in the request body, so a large scanned PDF
+  could not be transcribed at all before. Uploads use Google's documented resumable
+  protocol (`start` with the upload headers, then `upload, finalize`), poll the file
+  until it leaves `PROCESSING`, use it by URI on the same endpoint it was uploaded
+  to, and delete it afterwards.
+- Detection of endpoints that proxy only `generateContent`: a `404` on the files
+  endpoints raises `FilesApiUnsupported`, that endpoint is skipped, and the final
+  error suggests `max_pages` or local extraction. Both IBM ICA gateways behave this
+  way; Google AI Studio exposes the API.
+
+### Fixed
+
+- `upload_base()` derived the upload prefix by splitting the raw URL string, so a
+  base URL without a path (`https://example.com`) produced
+  `https://upload/example.com` - a different host. It now rewrites only the path.
+
+### Changed
+
+- An oversized PDF is no longer refused outright; it goes through the upload path
+  first and only fails when no endpoint can accept it.
+- `generate()` was factored into a single-attempt helper so the upload path can pair
+  one upload with one call on the same endpoint while keeping key and endpoint
+  failover behaviour identical.
+
 ## [0.4.0] - 2026-08-20
 
 ### Added

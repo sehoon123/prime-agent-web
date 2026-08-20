@@ -229,11 +229,18 @@ await webfetch(url, gemini=False)                # stay local, always
 | `prompt=`, or `gemini=True` | `gemini-url-context` | server-side fetch also reads JS-only and bot-blocked pages |
 | local fetch blocked or failed | `gemini-url-context` | recovers content instead of returning an error |
 | PDF with no text layer | `gemini-pdf` | a scan has nothing for pypdf to read |
+| scan over ~18 MB | `gemini-pdf` via Files API | too large to inline in a request |
 | anything else | local | no model call, no token cost |
 
 `doc.source` reports which tier answered; `doc.answer` holds the model text;
 `webfetch.gemini_available()` says whether the tiers are usable. A URL refused by the
 safety checks is never handed to the model either.
+
+Documents over the ~18 MB inline request limit are uploaded with the Gemini
+[Files API](https://ai.google.dev/gemini-api/docs/files) (resumable protocol, state
+polled until `ACTIVE`, file deleted afterwards). Google AI Studio exposes it; many
+corporate gateways proxy only `generateContent` and answer `404`, which is detected
+per endpoint and reported with a suggestion to use `max_pages` or local extraction.
 
 **A readability-style extractor was measured and rejected.** On an API reference page
 it returned 1.7 KB with zero headings and zero links, against 25 KB with 62 code
@@ -296,15 +303,16 @@ cd prime-agent-web
 PYTHONPATH=skills/websearch/src:skills/webfetch/src python3 -m unittest discover -s tests -t .
 ```
 
-182 offline tests, no network and no credentials required (`httpx.MockTransport`),
+201 offline tests, no network and no credentials required (`httpx.MockTransport`),
 covering backend discovery (`models.json`, `key-rotator.json`, credential
 precedence and source reporting), every backend's request shape and response
 parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool
 fallback, citation markers, redirect resolution including SSRF rejection,
 DuckDuckGo rate-limit handling and both parsers, cache behaviour, rendering,
 redaction, URL validation and DNS preflight, redirect and size guards, robots.txt
-verdicts, HTML/PDF/binary extraction, Gemini tier routing and failover, and the
-Prime Agent skill contract itself for
+verdicts, HTML/PDF/binary extraction, Gemini tier routing and failover, the resumable
+upload protocol including gateway `404` detection, and the Prime Agent skill contract
+itself for
 every skill in the package (including a reproduction of the kernel's module wrapper
 and a guard against helpers shadowing submodules).
 

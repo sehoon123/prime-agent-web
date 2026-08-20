@@ -118,5 +118,9 @@ there is nothing extra to configure here. Pin the model with `model=` if needed.
   with `kind="error"` and `error` set.
 - A large PDF fails with the exact `max_bytes=` value to retry with, instead of a
   library parse error.
+- A scanned PDF over the ~18 MB inline request limit is uploaded through the Gemini
+  Files API and deleted afterwards. Endpoints that proxy only `generateContent`
+  (common for corporate gateways) answer `404` there; that is detected and the error
+  suggests `max_pages` or local extraction instead.
 - For a whole repository, clone it (`git clone`) rather than fetching pages.
 - A URL refused by the safety checks is never handed to the model either.

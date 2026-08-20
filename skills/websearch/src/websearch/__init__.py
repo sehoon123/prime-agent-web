@@ -37,7 +37,7 @@ from .config import (
 )
 
 __all__ = ["run", "backends", "search", "SearchResult", "ResultItem", "Outcome", "clear_cache"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _USER_AGENT = "prime-agent-websearch/0.3 (+https://github.com/sehoon123/prime-agent-web)"
 
