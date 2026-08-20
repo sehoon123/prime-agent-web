@@ -1,7 +1,7 @@
 {
   "name": "prime-agent-websearch",
-  "version": "0.1.0",
-  "description": "Multi-backend web search skill for Prime Agent: Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, and keyless DuckDuckGo, auto-detected from the host's existing configuration.",
+  "version": "0.2.0",
+  "description": "Multi-backend web search skill for Prime Agent: Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, and keyless DuckDuckGo, with recency and domain filters, auto-detected from the host's existing configuration.",
   "keywords": [
     "pi-package",
     "prime-agent",

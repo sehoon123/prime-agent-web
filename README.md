@@ -1,11 +1,19 @@
 # prime-agent-websearch
 
-Multi-backend web search skill for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent).
+**Multi-backend web search skill for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent).**
+Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, self-hosted SearXNG, or
+keyless DuckDuckGo — auto-detected from the configuration your agent already has.
 
-Prime Agent ships one built-in search skill, and it only talks to
-[Serper](https://serper.dev), which needs a paid-after-2,500-queries key. This
-package is a drop-in superset: it keeps the same `websearch` import name and call
-style, and picks whichever backend the host can actually reach.
+[![CI](https://github.com/sehoon123/prime-agent-websearch/actions/workflows/ci.yml/badge.svg)](https://github.com/sehoon123/prime-agent-websearch/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+
+Prime Agent's bundled search skill talks only to [Serper](https://serper.dev),
+which needs a key that is free for 2,500 queries and prepaid after that. This
+package is a drop-in superset: same `websearch` import, same call style, but it
+uses whichever backend the host can actually reach — starting with Gemini
+grounding through a Gemini provider you already pay for (or Google AI Studio's free
+tier), and ending at keyless DuckDuckGo so it never hard-fails.
 
 ```python
 print(await websearch("prime agent latest release"))
@@ -16,13 +24,14 @@ print(await websearch("prime agent latest release"))
 
 ## gemini (ibm-ica-gemini/gemini-3.6-flash)
 
-Prime Agent's latest release is v0.7.4 ...
+Prime Agent's latest release is v0.7.4.[1] It is built around the Recursive
+Language Model and a Continual Harness.[1][2]
 
 ### Sources
 1. github.com
    https://github.com/PrimeIntellect-ai/prime-agent/releases
 2. primeintellect.ai
-   https://www.primeintellect.ai/blog/rlm
+   https://www.primeintellect.ai/blog/prime-agent
 
 ### Searches run
 prime agent latest release; primeintellect prime-agent releases
@@ -32,22 +41,25 @@ backends used: gemini · not configured: tavily, brave, exa, searxng
 
 ## Design
 
-Prime Agent has exactly one tool (`ipython`), so this is **not** a new agent tool.
-It is a Python-backed skill: a real package installed into the kernel venv and
-called from Python, per the
+Prime Agent exposes exactly one tool (`ipython`), so this is **not** a new agent
+tool. It is a Python-backed skill — a real package installed into the kernel venv
+and called from Python — per the
 [skills contract](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/docs/skills.md).
 
 - **Zero configuration.** Backends are discovered from files a Prime Agent install
-  already has (`models.json`, `auth.json`, optionally `key-rotator.json`) and from
-  standard environment variables. No new config file is introduced.
-- **Never hard-fails.** With nothing configured at all, keyless DuckDuckGo still
-  answers.
+  already has (`models.json`, `auth.json`, optionally `key-rotator.json`) plus the
+  usual environment variables. No new config file is introduced.
+- **Never hard-fails.** With nothing configured at all, keyless DuckDuckGo answers.
 - **Answers first.** `auto` prefers backends that return a grounded answer with
-  citations (Gemini, Tavily) over plain link lists.
-- **Model-readable output.** Markdown text, not JSON, ending with which backends
-  were used, unconfigured, or failed.
+  citations over plain link lists.
+- **Composition over parameters.** There is no `queries` argument: the kernel *is*
+  the batching layer (`asyncio.gather`). There is no result store or
+  `get_search_content` helper either — results are Python objects that stay in the
+  kernel.
+- **Model-readable output.** Markdown with `[n]` citation markers, ending with which
+  backends were used, unconfigured, or failed.
 - **Secrets stay out of output.** Credentials are redacted from returned text and
-  from error messages, including keys echoed back by a provider.
+  error messages, including keys a provider echoes back in its own error body.
 
 ## Install
 
@@ -55,34 +67,37 @@ called from Python, per the
 prime-agent package install git:github.com/sehoon123/prime-agent-websearch
 ```
 
-Then restart Prime Agent (a fresh session installs the Python package into the
-kernel venv) and verify:
+Restart Prime Agent (a fresh session installs the Python package into the kernel
+venv), then verify:
 
 ```python
 print(await websearch.backends())
 ```
 
-Local checkout instead:
+```text
+# websearch backends
 
-```bash
-prime-agent package install /path/to/prime-agent-websearch
+- ready  gemini - ibm-ica-gemini [models.json:ibm-ica-gemini + key-rotator (7 pool keys), 7 keys]
+- off    tavily
+           enable: set TAVILY_API_KEY, or store a tavily credential in auth.json
+...
+- ready  ddg - no credential required
+
+auto order: gemini, tavily, brave, serper, exa, searxng, ddg
+recency values: day, week, month, year
+cache: 300s in-process
 ```
 
-Uninstall:
-
-```bash
-prime-agent package remove git:github.com/sehoon123/prime-agent-websearch
-```
+Local checkout instead: `prime-agent package install /path/to/prime-agent-websearch`.
+Remove with `prime-agent package remove git:github.com/sehoon123/prime-agent-websearch`.
 
 ### Replacing the built-in skill
 
 A package skill overrides a built-in skill with the same name, so `websearch`
-resolves to this one after install. The Python distribution deliberately uses the
-same name as the bundled skill (`prime-agent-skill-websearch`) so the kernel can
-never end up with two packages providing the `websearch` import.
-
-If the built-in one was already installed in the kernel venv before, force a clean
-state once:
+resolves here after install. The Python distribution deliberately reuses the
+bundled skill's name (`prime-agent-skill-websearch`) so the kernel venv can never
+hold two packages providing the `websearch` import. If the bundled one was already
+installed, you can also pin it off:
 
 ```json
 {
@@ -93,38 +108,42 @@ state once:
 ## Usage
 
 ```python
-await websearch("gemini 3 pricing", num_results=8)      # 1-20 results
-await websearch("who won euro 2024", provider="ddg")    # force one backend
-await websearch("rust async runtimes", provider="all")  # every configured backend
-await websearch("cve-2026-1234", provider="gemini,ddg") # explicit chain
-await websearch.backends()                              # what is usable here
-help(websearch)                                         # full signature
+await websearch("gemini 3 pricing", num_results=8)               # 1-20 results
+await websearch("cve-2026-1234", recency="week")                 # day|week|month|year
+await websearch("rust async", domains="github.com,-reddit.com")  # "-" excludes
+await websearch("who won euro 2024", provider="ddg")             # force one backend
+await websearch("rust async runtimes", provider="all")           # all backends, concurrently
+await websearch("kernel panic", provider="gemini,ddg")           # explicit chain
+help(websearch)
 ```
 
-Shell cell:
+Batching, because the kernel is the composition layer:
 
-```bash
-!websearch "prime agent latest release" --num-results 8
+```python
+import asyncio
+answers = await asyncio.gather(*(websearch(q) for q in ["query a", "query b"]))
 ```
 
-Programmatic use, when rendered text is not wanted:
+Raw objects when rendered text is not what you want:
 
 ```python
 results = await websearch.search("prime agent", provider="all")
 for result in results:
-    print(result.backend, result.answer)
+    print(result.backend, result.detail, result.answer, result.dropped)
     for item in result.items:
         print(item.title, item.url, item.snippet)
 ```
 
+Shell cell: `!websearch "prime agent latest release" --num-results 8`
+
 ## Backends
 
-`provider="auto"` (the default) walks this order and returns the first backend
-that produces results.
+`provider="auto"` (the default) walks this order and returns the first backend that
+produces results.
 
 | Backend | Credential source | Cost | Output |
 |---|---|---|---|
-| `gemini` | a `google-generative-ai` provider in `models.json` + its key in `auth.json`, or `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `google` in `auth.json` | free tier on AI Studio; free on a corporate gateway you already pay for | grounded answer + resolved citations + the queries Google ran |
+| `gemini` | a `google-generative-ai` provider in `models.json` + its key in `auth.json`, or `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `google` in `auth.json` | free tier on AI Studio; free on a gateway you already pay for | grounded answer, `[n]` citations, resolved publisher URLs, the queries Google ran |
 | `tavily` | `TAVILY_API_KEY` or `tavily` in `auth.json` | free tier | answer + results |
 | `brave` | `BRAVE_API_KEY` / `BRAVE_SEARCH_API_KEY` or `brave` in `auth.json` | free tier | results |
 | `serper` | `SERPER_API_KEY` or `serper` in `auth.json` | 2,500 free, then prepaid | knowledge graph + results |
@@ -132,22 +151,36 @@ that produces results.
 | `searxng` | `SEARXNG_URL` | free, self-hosted | results |
 | `ddg` | none | free | results |
 
+### Filters
+
+`recency` and `domains` are translated to each backend's native parameter where one
+exists, expressed as query operators where it does not, and **always re-checked
+client-side** so a backend that silently ignores a filter cannot leak
+out-of-scope results. Removed results are reported as a count.
+
+| Backend | Recency | Domains |
+|---|---|---|
+| `gemini` | prompt hint | `site:` / `-site:` operators |
+| `tavily` | `time_range` | `include_domains` / `exclude_domains` |
+| `brave` | `freshness` (`pd`/`pw`/`pm`/`py`) | `site:` operators, over-fetch + filter |
+| `serper` | `tbs=qdr:d|w|m|y` | `site:` operators |
+| `exa` | `startPublishedDate` | `includeDomains` / `excludeDomains` |
+| `searxng` | `time_range` | `site:` operators |
+| `ddg` | `df=d|w|m|y` | client-side filter |
+
 ### Gemini backend
 
 Any provider in `models.json` whose `api` is `google-generative-ai` becomes a
 search backend — a corporate Gemini gateway works exactly like Google AI Studio,
 because grounding is requested through the standard `tools: [{google_search: {}}]`
-field (with an automatic fallback to the older `google_search_retrieval` name for
-gateways that still expect it).
-
-Grounding returns `vertexaisearch.cloud.google.com` redirect links. This skill
-resolves them to publisher URLs concurrently, and keeps the redirect link if
-resolution fails, so a source is never lost.
+field, with an automatic fallback to the older `google_search_retrieval` name for
+gateways that still expect it. Answers carry `[n]` markers derived from
+`groundingSupports`, so individual claims map to sources.
 
 If a [pi-api-key-rotator](https://github.com/sehoon123/pi-api-key-rotator) style
 `key-rotator.json` is present, the pool keys whose targets include that provider
-are added as failover candidates: a `401`/`403`/`429` on one key moves to the next
-key, then to the next endpoint, then to the next backend.
+become failover candidates: `401`/`403`/`429` moves to the next key, then the next
+endpoint, then the next backend.
 
 ## Environment overrides
 
@@ -156,6 +189,7 @@ key, then to the next endpoint, then to the next backend.
 | `PRIME_AGENT_WEBSEARCH_PROVIDER` | `auto` | default backend, `all`, or a comma-separated chain |
 | `PRIME_AGENT_WEBSEARCH_NUM_RESULTS` | `5` | default result count |
 | `PRIME_AGENT_WEBSEARCH_TIMEOUT` | `45` | HTTP timeout in seconds |
+| `PRIME_AGENT_WEBSEARCH_CACHE_TTL` | `300` | in-process cache TTL; `0` disables |
 | `PRIME_AGENT_WEBSEARCH_GEMINI_MODEL` | first `flash` model of the endpoint | pin the grounding model |
 | `PRIME_AGENT_WEBSEARCH_KEY_ROTATOR` | `<agent dir>/key-rotator.json` | path to a key-rotator config |
 | `SEARXNG_URL` | unset | SearXNG instance base URL |
@@ -166,13 +200,26 @@ resolves to that variable, otherwise the value is used literally. `!command`
 references are **not** executed from inside the kernel — export the value or use a
 literal for those providers.
 
+## Security
+
+See [SECURITY.md](SECURITY.md). Summary:
+
+- Grounding redirect links are resolved by reading `Location` with redirect
+  following **disabled**, so the target host is never contacted, and every hop is
+  validated — loopback, private, link-local, multicast, reserved, metadata
+  hostnames, non-`http(s)` schemes, and URLs carrying credentials are refused.
+- Credentials are redacted from every returned string; `backends()` shows only the
+  credential's source, never its value.
+- Search results are untrusted third-party text; treat snippets as data, not
+  instructions.
+
 ## Compatibility
 
 - Prime Agent 0.7+ (Python-backed skill contract with `run()`).
-- Python 3.10+; runtime dependencies `httpx` and `beautifulsoup4` are already in
-  the Prime Agent kernel venv. DuckDuckGo parsing falls back to a regex parser if
-  BeautifulSoup is missing, so the skill also works in a bare environment.
-- No OS-specific code: paths go through `pathlib`, and no shell command is ever run.
+- Python 3.10+. Runtime dependencies `httpx` and `beautifulsoup4` ship in the Prime
+  Agent kernel venv; DuckDuckGo parsing falls back to a regex parser when
+  BeautifulSoup is unavailable, so the skill also works in a bare environment.
+- No OS-specific code: paths go through `pathlib`, and no shell command is run.
 
 ## Development
 
@@ -182,11 +229,14 @@ cd prime-agent-websearch
 PYTHONPATH=skills/websearch/src python3 -m unittest discover -s tests -t .
 ```
 
-46 offline tests cover backend discovery (including `models.json` and
-`key-rotator.json` parsing), every backend's request shape and response parsing,
-Gemini key failover and legacy-tool fallback, DuckDuckGo redirect unwrapping with
-both parsers, rendering, and credential redaction. They use `httpx.MockTransport`,
-so no network access or credentials are required.
+97 offline tests, no network and no credentials required (`httpx.MockTransport`),
+covering backend discovery (`models.json`, `key-rotator.json`, credential
+precedence and source reporting), every backend's request shape and response
+parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool
+fallback, citation markers, redirect resolution including SSRF rejection,
+DuckDuckGo rate-limit handling and both parsers, cache behaviour, rendering,
+redaction, and the Prime Agent skill contract itself (including a reproduction of
+the kernel's module wrapper).
 
 Standalone smoke test outside the kernel:
 
@@ -194,6 +244,14 @@ Standalone smoke test outside the kernel:
 PYTHONPATH=skills/websearch/src python3 -m websearch            # list backends
 PYTHONPATH=skills/websearch/src python3 -m websearch "a query"  # real search
 ```
+
+## Credits
+
+Design informed by [pi-web-access](https://github.com/nicobailon/pi-web-access) by
+Nico Bailon — the equivalent capability for the pi agent, and the source of the
+provider-precedence, filter-mapping, and redirect-resolution patterns adapted here.
+That extension is a tool-based design for a many-tool host; this package is a
+skill-based design for a one-tool host.
 
 ## License
 

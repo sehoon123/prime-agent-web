@@ -240,3 +240,166 @@ class SettingsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DomainFilterTest(unittest.TestCase):
+    def test_normalize_domain_forms(self) -> None:
+        for raw, expected in [
+            ("github.com", "github.com"),
+            ("  GitHub.COM ", "github.com"),
+            ("https://github.com/owner/repo", "github.com"),
+            ("-reddit.com", "reddit.com"),
+            ("http://user@site.example.com/x?y=1", "site.example.com"),
+            (".github.com.", "github.com"),
+        ]:
+            self.assertEqual(config.normalize_domain(raw), expected, raw)
+
+    def test_normalize_domain_rejects_junk(self) -> None:
+        for raw in ("", "  ", "-", "two words", "under_score.com", "http://"):
+            self.assertIsNone(config.normalize_domain(raw), raw)
+
+    def test_parse_domains_from_list_and_string(self) -> None:
+        self.assertEqual(
+            config.parse_domains(["github.com", "-reddit.com", "https://lwn.net/x"]),
+            (("github.com", "lwn.net"), ("reddit.com",)),
+        )
+        self.assertEqual(
+            config.parse_domains("github.com, -reddit.com"),
+            (("github.com",), ("reddit.com",)),
+        )
+        self.assertEqual(config.parse_domains(None), ((), ()))
+        self.assertEqual(config.parse_domains([]), ((), ()))
+
+    def test_parse_domains_dedupes(self) -> None:
+        self.assertEqual(config.parse_domains(["a.com", "A.com", "a.com"]), (("a.com",), ()))
+
+
+class RecencyTest(unittest.TestCase):
+    def test_accepts_names_and_shorthands(self) -> None:
+        self.assertEqual(config.parse_recency("week"), "week")
+        self.assertEqual(config.parse_recency(" DAY "), "day")
+        self.assertEqual(config.parse_recency("m"), "month")
+        self.assertIsNone(config.parse_recency(None))
+        self.assertIsNone(config.parse_recency("  "))
+
+    def test_rejects_unknown(self) -> None:
+        with self.assertRaises(ValueError):
+            config.parse_recency("fortnight")
+
+    def test_start_date_is_in_the_past(self) -> None:
+        from datetime import datetime, timezone
+
+        now = datetime(2026, 3, 15, tzinfo=timezone.utc)
+        self.assertEqual(config.recency_start_date("day", now), "2026-03-14")
+        self.assertEqual(config.recency_start_date("week", now), "2026-03-08")
+        self.assertEqual(config.recency_start_date("year", now), "2025-03-15")
+
+
+class SearchQueryTest(unittest.TestCase):
+    def test_operator_text_builds_site_filters(self) -> None:
+        single = config.SearchQuery("q", include_domains=("a.com",))
+        self.assertEqual(single.operator_text(), "q site:a.com")
+
+        multi = config.SearchQuery("q", include_domains=("a.com", "b.com"), exclude_domains=("c.com",))
+        self.assertEqual(multi.operator_text(), "q (site:a.com OR site:b.com) -site:c.com")
+
+        plain = config.SearchQuery("q")
+        self.assertEqual(plain.operator_text(), "q")
+
+    def test_recency_hint_is_opt_in(self) -> None:
+        query = config.SearchQuery("q", recency="week")
+        self.assertEqual(query.operator_text(), "q")
+        self.assertEqual(query.operator_text(with_recency_hint=True), "q (published within the last week)")
+
+    def test_allows_matches_subdomains(self) -> None:
+        query = config.SearchQuery("q", include_domains=("example.com",))
+        self.assertTrue(query.allows("https://example.com/a"))
+        self.assertTrue(query.allows("https://docs.example.com/a"))
+        self.assertFalse(query.allows("https://notexample.com/a"))
+        self.assertFalse(query.allows("https://other.org/a"))
+
+    def test_exclude_wins_over_include(self) -> None:
+        query = config.SearchQuery("q", include_domains=("example.com",), exclude_domains=("bad.example.com",))
+        self.assertTrue(query.allows("https://good.example.com/a"))
+        self.assertFalse(query.allows("https://bad.example.com/a"))
+
+    def test_no_filter_allows_everything(self) -> None:
+        self.assertTrue(config.SearchQuery("q").allows("https://anything.example"))
+
+    def test_cache_key_distinguishes_parameters(self) -> None:
+        base = config.SearchQuery("q", num_results=5)
+        self.assertNotEqual(base.cache_key, config.SearchQuery("q", num_results=6).cache_key)
+        self.assertNotEqual(base.cache_key, config.SearchQuery("q", recency="week").cache_key)
+        self.assertNotEqual(base.cache_key, config.SearchQuery("q", include_domains=("a.com",)).cache_key)
+        self.assertEqual(base.cache_key, config.SearchQuery("q", num_results=5).cache_key)
+
+
+class UrlSafetyTest(unittest.TestCase):
+    def test_public_urls_pass(self) -> None:
+        for url in (
+            "https://example.com/a",
+            "http://sub.example.co.uk/b?c=1",
+            "https://8.8.8.8/dns",
+        ):
+            self.assertTrue(config.is_public_http_url(url), url)
+
+    def test_private_and_local_targets_are_blocked(self) -> None:
+        for url in (
+            "http://169.254.169.254/latest/meta-data/",   # cloud metadata
+            "http://metadata.google.internal/x",
+            "http://127.0.0.1:8080/admin",
+            "http://localhost/admin",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]/",
+            "http://[fd00::1]/",
+            "http://printer.local/",
+            "http://vault.internal/",
+            "http://intranet/",                            # bare internal label
+        ):
+            self.assertFalse(config.is_public_http_url(url), url)
+
+    def test_non_http_schemes_and_credentials_are_blocked(self) -> None:
+        for url in (
+            "file:///etc/passwd",
+            "ftp://example.com/x",
+            "gopher://example.com/",
+            "javascript:alert(1)",
+            "https://user:pass@example.com/",
+            "",
+            "   ",
+        ):
+            self.assertFalse(config.is_public_http_url(url), url)
+
+
+class CredentialSourceTest(unittest.TestCase):
+    def test_source_reports_env_var_name(self) -> None:
+        with mock.patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-x"}, clear=True):
+            found = config.find_credential({}, ("tavily",), ("TAVILY_API_KEY",))
+        assert found
+        self.assertEqual(found.source, "$TAVILY_API_KEY")
+
+    def test_source_reports_auth_entry(self) -> None:
+        auth = {"tavily": {"type": "api_key", "key": "tvly-x"}}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            found = config.find_credential(auth, ("tavily",), ("TAVILY_API_KEY",))
+        assert found
+        self.assertEqual(found.source, "auth.json:tavily")
+
+    def test_gemini_endpoint_source_mentions_rotator(self) -> None:
+        models_json = {
+            "providers": {
+                "corp": {
+                    "baseUrl": "https://gw.example.com/v1beta",
+                    "api": "google-generative-ai",
+                    "models": [{"id": "gemini-3.6-flash"}],
+                }
+            }
+        }
+        auth = {"corp": {"type": "api_key", "key": "sk-corp"}}
+        rotator = config.RotatorKeys(by_provider={"corp": ["sk-pool-1", "sk-pool-2"]})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            endpoints = config.gemini_endpoints(models_json=models_json, auth=auth, rotator=rotator)
+        self.assertIn("models.json:corp", endpoints[0].source)
+        self.assertIn("key-rotator (2 pool keys)", endpoints[0].source)

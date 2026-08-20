@@ -1,4 +1,4 @@
-"""Backend discovery for the websearch skill.
+"""Backend discovery and request shaping for the websearch skill.
 
 Everything is derived from files and environment variables that a Prime Agent
 install already has. This module never writes anything and never returns a
@@ -7,11 +7,14 @@ secret in an error message.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Optional, Sequence, Union
 
 GOOGLE_API = "google-generative-ai"
 AI_STUDIO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -26,8 +29,12 @@ AI_STUDIO_FALLBACK_MODELS: tuple[str, ...] = (
 
 DEFAULT_NUM_RESULTS = 5
 DEFAULT_TIMEOUT = 45.0
+DEFAULT_CACHE_TTL = 300.0
 MAX_NUM_RESULTS = 20
 MAX_QUERY_CHARS = 2000
+
+RECENCY_VALUES: tuple[str, ...] = ("day", "week", "month", "year")
+RECENCY_DAYS = {"day": 1, "week": 7, "month": 31, "year": 365}
 
 # Backend order used by provider="auto". Answer-producing backends come first.
 AUTO_ORDER: tuple[str, ...] = ("gemini", "tavily", "brave", "serper", "exa", "searxng", "ddg")
@@ -46,8 +53,13 @@ ENABLE_HINTS: dict[str, str] = {
     "ddg": "always available (no credential required)",
 }
 
+# Backends that support a native recency filter. Others get a query hint instead.
+NATIVE_RECENCY: frozenset[str] = frozenset({"tavily", "brave", "serper", "exa", "searxng", "ddg"})
+# Backends that support native domain include/exclude fields.
+NATIVE_DOMAINS: frozenset[str] = frozenset({"tavily", "exa"})
 
-def env_str(name: str) -> str | None:
+
+def env_str(name: str) -> Optional[str]:
     value = os.environ.get(name, "").strip()
     return value or None
 
@@ -112,7 +124,7 @@ def read_first_json(filename: str) -> dict[str, Any]:
     return {}
 
 
-def resolve_secret(raw: Any) -> str | None:
+def resolve_secret(raw: Any) -> Optional[str]:
     """Resolve a credential the way Prime Agent does: env var name, else literal.
 
     `!command` references are intentionally not executed from inside the kernel;
@@ -126,32 +138,206 @@ def resolve_secret(raw: Any) -> str | None:
     return (os.environ.get(value) or value).strip() or None
 
 
-def auth_credential(auth: dict[str, Any], credential_id: str) -> str | None:
+def auth_credential(auth: dict[str, Any], credential_id: str) -> Optional[str]:
     entry = auth.get(credential_id)
     if not isinstance(entry, dict) or entry.get("type") != "api_key":
         return None
     return resolve_secret(entry.get("key"))
 
 
-def credential(auth: dict[str, Any], credential_ids: Sequence[str], env_names: Sequence[str]) -> str | None:
+@dataclass(frozen=True)
+class Credential:
+    """A resolved credential plus where it came from (never the value itself)."""
+
+    value: str
+    source: str
+
+
+def find_credential(
+    auth: dict[str, Any],
+    credential_ids: Sequence[str],
+    env_names: Sequence[str],
+) -> Optional[Credential]:
     """First credential found. Environment variables win over stored ones."""
     for name in env_names:
         value = env_str(name)
         if value:
-            return value
+            return Credential(value, f"${name}")
     for credential_id in credential_ids:
         value = auth_credential(auth, credential_id)
         if value:
-            return value
+            return Credential(value, f"auth.json:{credential_id}")
     return None
 
 
-def _dedupe(values: Iterable[str | None]) -> tuple[str, ...]:
+def credential(
+    auth: dict[str, Any],
+    credential_ids: Sequence[str],
+    env_names: Sequence[str],
+) -> Optional[str]:
+    found = find_credential(auth, credential_ids, env_names)
+    return found.value if found else None
+
+
+def _dedupe(values: Iterable[Optional[str]]) -> tuple[str, ...]:
     seen: list[str] = []
     for value in values:
         if value and value not in seen:
             seen.append(value)
     return tuple(seen)
+
+
+# --------------------------------------------------------------------------- #
+# URL safety
+# --------------------------------------------------------------------------- #
+
+_PRIVATE_HOST_SUFFIXES = (".local", ".internal", ".localdomain", ".home.arpa")
+_BLOCKED_HOSTS = frozenset({"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"})
+
+
+def is_public_http_url(url: str) -> bool:
+    """True when `url` is an http(s) URL that does not target a private host.
+
+    Applied to URLs discovered in provider responses (notably redirect targets)
+    before they are shown or followed, so a redirect can never point the agent at
+    loopback, link-local metadata services, or private ranges.
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    if "@" in (parts.netloc or ""):  # credentials in the authority
+        return False
+
+    host = parts.hostname.lower().rstrip(".")
+    if host in _BLOCKED_HOSTS or host.endswith(_PRIVATE_HOST_SUFFIXES):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "." in host  # a real registered name, not a bare internal label
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Query shaping
+# --------------------------------------------------------------------------- #
+
+
+def normalize_domain(raw: str) -> Optional[str]:
+    """Turn user input into a bare hostname: '-https://Example.com/docs' -> 'example.com'."""
+    from urllib.parse import urlsplit
+
+    value = (raw or "").strip().lstrip("-").strip()
+    if not value:
+        return None
+    if "://" in value:
+        value = urlsplit(value).hostname or ""
+    value = value.split("/")[0].split("@")[-1].strip().strip(".").lower()
+    if not value or " " in value:
+        return None
+    return value if re.fullmatch(r"[a-z0-9.-]+", value) else None
+
+
+def parse_domains(domains: Union[str, Sequence[str], None]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a domain filter into (include, exclude). A leading '-' excludes."""
+    if domains is None:
+        return (), ()
+    raw_list = [part for part in re.split(r"[,\s]+", domains) if part] if isinstance(domains, str) else list(domains)
+    include: list[str] = []
+    exclude: list[str] = []
+    for raw in raw_list:
+        domain = normalize_domain(raw)
+        if not domain:
+            continue
+        target = exclude if str(raw).strip().startswith("-") else include
+        if domain not in target:
+            target.append(domain)
+    return tuple(include), tuple(exclude)
+
+
+def parse_recency(recency: Optional[str]) -> Optional[str]:
+    if recency is None:
+        return None
+    value = recency.strip().lower()
+    if not value:
+        return None
+    aliases = {"d": "day", "w": "week", "m": "month", "y": "year"}
+    value = aliases.get(value, value)
+    if value not in RECENCY_VALUES:
+        raise ValueError(f"recency must be one of {', '.join(RECENCY_VALUES)} (got {recency!r})")
+    return value
+
+
+def host_matches(hostname: str, domain: str) -> bool:
+    host = (hostname or "").lower().rstrip(".")
+    return host == domain or host.endswith(f".{domain}")
+
+
+def recency_start_date(recency: str, now: Optional[datetime] = None) -> str:
+    """ISO-8601 start date for backends that only accept an absolute date."""
+    moment = now or datetime.now(timezone.utc)
+    return (moment - timedelta(days=RECENCY_DAYS[recency])).strftime("%Y-%m-%d")
+
+
+@dataclass(frozen=True)
+class SearchQuery:
+    """One normalized search request, shared by every backend."""
+
+    text: str
+    num_results: int = DEFAULT_NUM_RESULTS
+    recency: Optional[str] = None
+    include_domains: tuple[str, ...] = ()
+    exclude_domains: tuple[str, ...] = ()
+
+    @property
+    def cache_key(self) -> tuple[Any, ...]:
+        return (self.text, self.num_results, self.recency, self.include_domains, self.exclude_domains)
+
+    def operator_text(self, *, with_recency_hint: bool = False) -> str:
+        """Query string with `site:` operators for backends without native fields."""
+        parts = [self.text]
+        if self.include_domains:
+            if len(self.include_domains) == 1:
+                parts.append(f"site:{self.include_domains[0]}")
+            else:
+                parts.append("(" + " OR ".join(f"site:{domain}" for domain in self.include_domains) + ")")
+        parts.extend(f"-site:{domain}" for domain in self.exclude_domains)
+        if with_recency_hint and self.recency:
+            parts.append(f"(published within the last {self.recency})")
+        return " ".join(parts)
+
+    def allows(self, url: str) -> bool:
+        """Client-side domain filter, applied to every backend as a safety net."""
+        if not self.include_domains and not self.exclude_domains:
+            return True
+        from urllib.parse import urlsplit
+
+        try:
+            hostname = urlsplit(url).hostname or ""
+        except ValueError:
+            return False
+        if self.exclude_domains and any(host_matches(hostname, domain) for domain in self.exclude_domains):
+            return False
+        if self.include_domains and not any(host_matches(hostname, domain) for domain in self.include_domains):
+            return False
+        return True
+
+
+# --------------------------------------------------------------------------- #
+# Gemini endpoints
+# --------------------------------------------------------------------------- #
 
 
 @dataclass(frozen=True)
@@ -162,14 +348,18 @@ class GeminiEndpoint:
     base_url: str
     models: tuple[str, ...] = ()
     keys: tuple[str, ...] = ()
+    source: str = ""
 
-    def pick_model(self, pinned: str | None) -> str | None:
+    def pick_model(self, pinned: Optional[str]) -> Optional[str]:
         if pinned:
             return pinned
         for model in self.models:
             if "flash" in model:
                 return model
         return self.models[0] if self.models else None
+
+    def with_models(self, models: Sequence[str]) -> "GeminiEndpoint":
+        return GeminiEndpoint(self.label, self.base_url, tuple(models), self.keys, self.source)
 
 
 @dataclass
@@ -270,9 +460,9 @@ def _provider_model_ids(provider: dict[str, Any]) -> tuple[str, ...]:
 
 
 def gemini_endpoints(
-    models_json: dict[str, Any] | None = None,
-    auth: dict[str, Any] | None = None,
-    rotator: RotatorKeys | None = None,
+    models_json: Optional[dict[str, Any]] = None,
+    auth: Optional[dict[str, Any]] = None,
+    rotator: Optional[RotatorKeys] = None,
 ) -> tuple[GeminiEndpoint, ...]:
     """Every Gemini-compatible endpoint this host can reach.
 
@@ -293,35 +483,53 @@ def gemini_endpoints(
             base_url = provider.get("baseUrl")
             if not isinstance(base_url, str) or not base_url.strip():
                 continue
+            pool_keys = rotator.get(provider_id)
             keys = _dedupe(
                 [
                     auth_credential(auth, provider_id),
                     resolve_secret(provider.get("apiKey")),
-                    *rotator.get(provider_id),
+                    *pool_keys,
                 ]
             )
             if not keys:
                 continue
+            source = f"models.json:{provider_id}"
+            if pool_keys:
+                source += f" + key-rotator ({len(pool_keys)} pool keys)"
             endpoints.append(
                 GeminiEndpoint(
                     label=provider_id,
                     base_url=base_url.strip().rstrip("/"),
                     models=_provider_model_ids(provider),
                     keys=keys,
+                    source=source,
                 )
             )
 
-    studio_key = credential(auth, ("google", "gemini"), ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
-    if studio_key:
+    studio = find_credential(auth, ("google", "gemini"), ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+    if studio:
         endpoints.append(
             GeminiEndpoint(
                 label="google-ai-studio",
                 base_url=AI_STUDIO_BASE_URL,
                 models=(),
-                keys=(studio_key,),
+                keys=(studio.value,),
+                source=studio.source,
             )
         )
     return tuple(endpoints)
+
+
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
+
+_SIMPLE_CREDENTIALS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "serper": (("serper",), ("SERPER_API_KEY",)),
+    "tavily": (("tavily",), ("TAVILY_API_KEY",)),
+    "brave": (("brave", "brave-search"), ("BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY")),
+    "exa": (("exa",), ("EXA_API_KEY",)),
+}
 
 
 @dataclass(frozen=True)
@@ -331,8 +539,9 @@ class Settings:
     num_results: int
     timeout: float
     order: tuple[str, ...]
-    gemini_model: str | None
-    searxng_url: str | None
+    gemini_model: Optional[str]
+    searxng_url: Optional[str]
+    cache_ttl: float
     auth: dict[str, Any]
 
     @property
@@ -341,26 +550,23 @@ class Settings:
         values: list[str] = []
         for endpoint in self.gemini_endpoints:
             values.extend(endpoint.keys)
-        for name in ("serper", "tavily", "brave", "exa"):
-            value = self.simple_key(name)
-            if value:
-                values.append(value)
+        for name in _SIMPLE_CREDENTIALS:
+            found = self.find_simple(name)
+            if found:
+                values.append(found.value)
         return _dedupe(values)
 
     @property
     def gemini_endpoints(self) -> tuple[GeminiEndpoint, ...]:
         return gemini_endpoints(auth=self.auth)
 
-    def simple_key(self, backend: str) -> str | None:
-        if backend == "serper":
-            return credential(self.auth, ("serper",), ("SERPER_API_KEY",))
-        if backend == "tavily":
-            return credential(self.auth, ("tavily",), ("TAVILY_API_KEY",))
-        if backend == "brave":
-            return credential(self.auth, ("brave", "brave-search"), ("BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"))
-        if backend == "exa":
-            return credential(self.auth, ("exa",), ("EXA_API_KEY",))
-        return None
+    def find_simple(self, backend: str) -> Optional[Credential]:
+        spec = _SIMPLE_CREDENTIALS.get(backend)
+        return find_credential(self.auth, *spec) if spec else None
+
+    def simple_key(self, backend: str) -> Optional[str]:
+        found = self.find_simple(backend)
+        return found.value if found else None
 
     def available(self, backend: str) -> bool:
         if backend == "ddg":
@@ -371,8 +577,22 @@ class Settings:
             return bool(self.searxng_url)
         return bool(self.simple_key(backend))
 
+    def describe(self, backend: str) -> str:
+        """Where this backend's credential came from, for backends()."""
+        if backend == "ddg":
+            return "no credential required"
+        if backend == "gemini":
+            return ", ".join(
+                f"{endpoint.label} [{endpoint.source}, {len(endpoint.keys)} key{'' if len(endpoint.keys) == 1 else 's'}]"
+                for endpoint in self.gemini_endpoints
+            )
+        if backend == "searxng":
+            return self.searxng_url or ""
+        found = self.find_simple(backend)
+        return found.source if found else ""
 
-def parse_order(provider: str | None, default_order: Sequence[str] = AUTO_ORDER) -> tuple[str, ...]:
+
+def parse_order(provider: Optional[str], default_order: Sequence[str] = AUTO_ORDER) -> tuple[str, ...]:
     """Turn a provider argument into an ordered backend list.
 
     Accepts "auto", "all", a single backend name, or a comma-separated list.
@@ -387,23 +607,29 @@ def parse_order(provider: str | None, default_order: Sequence[str] = AUTO_ORDER)
             f"unknown search backend(s): {', '.join(unknown)}. "
             f"available: {', '.join(default_order)}, or auto/all"
         )
-    return tuple(names)
+    seen: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
-def wants_every_backend(provider: str | None) -> bool:
+def wants_every_backend(provider: Optional[str]) -> bool:
     raw = (provider or env_str("PRIME_AGENT_WEBSEARCH_PROVIDER") or "auto").strip().lower()
-    if raw == "all":
-        return True
-    return "," in raw
+    return raw == "all" or "," in raw
 
 
 def load_settings(
-    num_results: int | None = None,
-    timeout: float | None = None,
-    provider: str | None = None,
-    model: str | None = None,
+    num_results: Optional[int] = None,
+    timeout: Optional[float] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Settings:
-    count = num_results if num_results is not None else env_int("PRIME_AGENT_WEBSEARCH_NUM_RESULTS", DEFAULT_NUM_RESULTS)
+    count = (
+        num_results
+        if num_results is not None
+        else env_int("PRIME_AGENT_WEBSEARCH_NUM_RESULTS", DEFAULT_NUM_RESULTS)
+    )
     count = max(1, min(MAX_NUM_RESULTS, count))
     seconds = timeout if timeout is not None else env_float("PRIME_AGENT_WEBSEARCH_TIMEOUT", DEFAULT_TIMEOUT)
     searxng = env_str("SEARXNG_URL") or env_str("PRIME_AGENT_WEBSEARCH_SEARXNG_URL")
@@ -413,5 +639,6 @@ def load_settings(
         order=parse_order(provider),
         gemini_model=model or env_str("PRIME_AGENT_WEBSEARCH_GEMINI_MODEL"),
         searxng_url=searxng.rstrip("/") if searxng else None,
+        cache_ttl=max(0.0, env_float("PRIME_AGENT_WEBSEARCH_CACHE_TTL", DEFAULT_CACHE_TTL)),
         auth=read_first_json("auth.json"),
     )
