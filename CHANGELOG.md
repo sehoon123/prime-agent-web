@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-20
+
+### Added
+
+- **Optional Gemini tiers in `webfetch`**, used only where local extraction cannot
+  work. Endpoints, keys and key-rotator failover are reused from the `websearch`
+  skill's discovery, so there is nothing extra to configure and no second source of
+  truth. With no Gemini configured, every local capability keeps working and the
+  tiers report why they are unavailable.
+  - `prompt="..."` answers a question about a page through the `url_context` tool.
+    Because Gemini fetches server-side, this also reads pages that need JavaScript
+    or block scripted clients.
+  - A YouTube link is read as a video (`fileData` part): content plus what is shown
+    on screen.
+  - A PDF with no text layer is transcribed by vision instead of returning an empty
+    extraction - the deterministic-then-model tier chain used by pi-web-access.
+  - A locally blocked or failed fetch falls back to `url_context` rather than
+    returning an error.
+  - `gemini=False` forces the local path, `gemini=True` forces the model path,
+    `model=` pins the Gemini model.
+- `Document.source` (`local`, `gemini-url-context`, `gemini-video`, `gemini-pdf`),
+  `Document.answer`, `Document.retrieved_urls`, and `webfetch.gemini_available()`.
+
+### Security
+
+- A URL refused by the safety checks is never passed to the model either: unsafe-URL
+  errors short-circuit before any tier, so `url_context` cannot be used to reach an
+  address the local fetcher would refuse.
+- Oversized PDFs are refused before the request when they exceed the inline payload
+  limit for model extraction.
+
 ## [0.3.0] - 2026-08-20
 
 ### Added

@@ -2,7 +2,7 @@
 # Distribution name mirrors the bundled-skill convention used by Prime Agent, so
 # the `webfetch` import can only ever come from one installed package.
 name = "prime-agent-skill-webfetch"
-version = "0.3.0"
+version = "0.4.0"
 description = "Fetch URLs as readable markdown for Prime Agent: structure-preserving HTML extraction, PDF text, SSRF-guarded requests"
 readme = "SKILL.md"
 requires-python = ">=3.10"

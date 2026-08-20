@@ -19,6 +19,7 @@ from typing import Optional, Sequence, Union
 
 import httpx
 
+from . import _gemini
 from ._extract import (
     Extracted,
     html_to_markdown,
@@ -43,8 +44,8 @@ from ._safety import (
     guarded_get,
 )
 
-__all__ = ["run", "fetch", "Document", "FetchError", "UnsafeUrlError", "TooLargeError"]
-__version__ = "0.3.0"
+__all__ = ["run", "fetch", "Document", "FetchError", "UnsafeUrlError", "TooLargeError", "gemini_available"]
+__version__ = "0.4.0"
 
 MODES = ("markdown", "text", "raw")
 DEFAULT_MAX_CHARS = 20_000
@@ -91,6 +92,11 @@ class Document:
     saved_path: Optional[str] = None
     error: Optional[str] = None
     notes: list[str] = field(default_factory=list)
+    answer: Optional[str] = None
+    """Model answer, when a prompt was given or a page needed model extraction."""
+    source: str = "local"
+    """local, gemini-url-context, gemini-video, or gemini-pdf."""
+    retrieved_urls: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -116,6 +122,35 @@ def _extract_body(body_bytes: bytes, content_type: str, text: str, mode: str, ma
     return Extracted(kind="binary", text="")
 
 
+async def _gemini_document(
+    client: httpx.AsyncClient,
+    url: str,
+    source: str,
+    coroutine: Any,
+    notes: list[str],
+) -> Document:
+    """Wrap a Gemini call as a Document, keeping failures inside the Document."""
+    try:
+        answer = await coroutine
+    except _gemini.GeminiUnavailable as error:
+        return Document(url=url, final_url=url, kind="error", error=str(error), notes=notes)
+    except RuntimeError as error:
+        return Document(
+            url=url, final_url=url, kind="error", error=f"{source} failed: {error}", notes=notes
+        )
+    return Document(
+        url=url,
+        final_url=url,
+        kind="answer",
+        text=answer.text,
+        content_type="",
+        source=source,
+        answer=answer.text,
+        retrieved_urls=answer.retrieved_urls,
+        notes=notes + [f"{source} via {answer.detail}"],
+    )
+
+
 async def _fetch_one(
     client: httpx.AsyncClient,
     url: str,
@@ -124,9 +159,46 @@ async def _fetch_one(
     max_pages: Optional[int],
     resolver: Optional[Resolver],
     robots: Optional[RobotsCache],
+    prompt: Optional[str],
+    gemini: Optional[bool],
+    model: Optional[str],
+    timeout: Optional[float],
 ) -> Document:
     target, rewrite_note = rewrite_url(url.strip())
     notes = [rewrite_note] if rewrite_note else []
+    allow_gemini = gemini is not False
+
+    # Tier 1: a video can only be read by the model.
+    if _gemini.is_video_url(target):
+        if not allow_gemini:
+            return Document(
+                url=url,
+                final_url=target,
+                kind="error",
+                error="reading a video needs Gemini, but gemini=False was passed",
+                notes=notes,
+            )
+        return await _gemini_document(
+            client,
+            target,
+            "gemini-video",
+            _gemini.describe_video(client, target, prompt, model=model, timeout=timeout),
+            notes,
+        )
+
+    # Tier 2: an explicit question, or gemini=True, goes through url_context, which
+    # also reaches pages that need JavaScript or block scripted clients.
+    if allow_gemini and (prompt or gemini is True) and _gemini.available():
+        document = await _gemini_document(
+            client,
+            target,
+            "gemini-url-context",
+            _gemini.answer_about_url(client, target, prompt or "Summarise this page.", model=model, timeout=timeout),
+            notes,
+        )
+        if document.ok:
+            return document
+        notes = notes + [f"url_context unavailable ({document.error}); fetched locally instead"]
 
     if robots is not None:
         try:
@@ -139,7 +211,27 @@ async def _fetch_one(
 
     try:
         body = await guarded_get(client, target, max_bytes=max_bytes, resolver=resolver)
+    except UnsafeUrlError as error:
+        # Never hand a refused target to a model either.
+        return Document(url=url, final_url=target, kind="error", error=str(error), notes=notes)
     except FetchError as error:
+        # Tier 3: blocked or JavaScript-only pages often still work server-side.
+        if allow_gemini and _gemini.available():
+            fallback = await _gemini_document(
+                client,
+                target,
+                "gemini-url-context",
+                _gemini.answer_about_url(
+                    client,
+                    target,
+                    prompt or "Extract the readable content of this page as markdown.",
+                    model=model,
+                    timeout=timeout,
+                ),
+                notes + [f"local fetch failed ({error})"],
+            )
+            if fallback.ok:
+                return fallback
         return Document(url=url, final_url=target, kind="error", error=str(error), notes=notes)
 
     if body.truncated:
@@ -176,6 +268,28 @@ async def _fetch_one(
             notes=notes,
         )
 
+    # Tier 3b: a PDF with no text layer is a scan; only vision can read it.
+    if (
+        extracted.kind == "pdf"
+        and allow_gemini
+        and any("scanned" in note for note in extracted.notes)
+        and _gemini.available()
+    ):
+        escalated = await _gemini_document(
+            client,
+            body.final_url,
+            "gemini-pdf",
+            _gemini.read_pdf(client, body.content, prompt, model=model, timeout=timeout),
+            notes + extracted.notes,
+        )
+        if escalated.ok:
+            escalated.kind = "pdf"
+            escalated.content_type = body.content_type
+            escalated.status = body.status
+            escalated.bytes_len = len(body.content)
+            escalated.pages = extracted.pages
+            return escalated
+
     return Document(
         url=url,
         final_url=body.final_url,
@@ -195,6 +309,9 @@ async def fetch(
     url: Union[str, Sequence[str]],
     *,
     mode: str = "markdown",
+    prompt: Optional[str] = None,
+    gemini: Optional[bool] = None,
+    model: Optional[str] = None,
     max_bytes: Optional[int] = None,
     max_pages: Optional[int] = None,
     timeout: Optional[float] = None,
@@ -207,8 +324,10 @@ async def fetch(
     A list of URLs is fetched concurrently (bounded), and a failure becomes a
     Document with `kind="error"` instead of raising, so one bad URL cannot lose the
     others. `respect_robots` defaults to True (see PRIME_AGENT_WEBFETCH_RESPECT_ROBOTS);
-    set it False when the user explicitly asked for a page. `resolver` and
-    `transport` are injection points for tests and custom networking.
+    set it False when the user explicitly asked for a page. `prompt` asks a question
+    about the page instead of dumping it; `gemini=False` keeps everything local and
+    `gemini=True` forces the model path. `resolver` and `transport` are injection
+    points for tests and custom networking.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {', '.join(MODES)} (got {mode!r})")
@@ -237,7 +356,19 @@ async def fetch(
 
         async def one(target: str) -> Document:
             async with semaphore:
-                return await _fetch_one(client, target, mode, max(1024, cap), max_pages, resolver, robots)
+                return await _fetch_one(
+                    client,
+                    target,
+                    mode,
+                    max(1024, cap),
+                    max_pages,
+                    resolver,
+                    robots,
+                    prompt,
+                    gemini,
+                    model,
+                    max(1.0, seconds),
+                )
 
         documents = await asyncio.gather(*(one(target) for target in urls))
 
@@ -250,7 +381,11 @@ def _render(document: Document, max_chars: int) -> str:
             "\n\n" + "\n".join(f"note: {note}" for note in document.notes) if document.notes else ""
         )
 
-    facts = [document.kind, f"{document.bytes_len:,} bytes"]
+    facts = [document.kind]
+    if document.source != "local":
+        facts.append(document.source)
+    if document.bytes_len:
+        facts.append(f"{document.bytes_len:,} bytes")
     if document.content_type:
         facts.append(document.content_type)
     if document.pages:
@@ -264,6 +399,8 @@ def _render(document: Document, max_chars: int) -> str:
     header.append(" · ".join(facts))
     for note in document.notes:
         header.append(f"note: {note}")
+    if document.retrieved_urls:
+        header.append("retrieved: " + ", ".join(document.retrieved_urls[:5]))
 
     body = document.text
     if max_chars > 0 and len(body) > max_chars:
@@ -279,17 +416,24 @@ def _render(document: Document, max_chars: int) -> str:
 
 async def run(
     url: str,
+    prompt: Optional[str] = None,
     mode: str = "markdown",
     max_chars: Optional[int] = None,
     max_pages: Optional[int] = None,
     max_bytes: Optional[int] = None,
     respect_robots: Optional[bool] = None,
+    gemini: Optional[bool] = None,
+    model: Optional[str] = None,
     timeout: Optional[float] = None,
 ) -> str:
     """Fetch a URL and return its content as readable text.
 
     Args:
         url: An http(s) URL. GitHub blob links are rewritten to raw file contents.
+            A YouTube link is read as a video when Gemini is configured.
+        prompt: Ask a question about the page instead of returning all of it. Uses
+            Gemini's url_context tool, which also reaches pages that need JavaScript
+            or block scripted clients.
         mode: "markdown" (default) converts HTML while keeping headings, code blocks
             and link targets; "text" returns plain text; "raw" returns the body
             exactly as served, for JSON and other machine formats.
@@ -299,6 +443,10 @@ async def run(
         max_bytes: Body size cap (default 10 MB). Large PDFs need a higher value.
         respect_robots: Check robots.txt first (default True). Set False when the
             user explicitly asked for this page.
+        gemini: None (default) uses Gemini only where local extraction cannot work -
+            videos, scanned PDFs, a given prompt, or a blocked page. False keeps
+            everything local. True forces the model path.
+        model: Pin the Gemini model, e.g. "gemini-2.5-flash".
         timeout: HTTP timeout in seconds (default 45).
 
     Returns:
@@ -312,6 +460,9 @@ async def run(
         document = await fetch(
             url,
             mode=mode,
+            prompt=prompt,
+            gemini=gemini,
+            model=model,
             max_pages=max_pages,
             max_bytes=max_bytes,
             respect_robots=respect_robots,
@@ -321,6 +472,11 @@ async def run(
         return f"webfetch failed: {error}"
     assert isinstance(document, Document)
     return _render(document, max(0, limit))
+
+
+def gemini_available() -> bool:
+    """True when a Gemini endpoint is discoverable, enabling video, prompt and scan support."""
+    return _gemini.available()
 
 
 def cli() -> None:  # pragma: no cover - for `python -m webfetch` outside the kernel

@@ -6,7 +6,7 @@ search and fetch.** Two Python-backed skills in one package:
 | Skill | Call | What it does |
 |---|---|---|
 | `websearch` | `await websearch("query")` | Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, self-hosted SearXNG, or keyless DuckDuckGo — auto-detected from the configuration your agent already has |
-| `webfetch` | `await webfetch(url)` | reads a page as markdown (headings, code blocks and links kept), extracts PDF text per page, rewrites GitHub blob links to raw contents — through SSRF-guarded requests |
+| `webfetch` | `await webfetch(url)` | reads a page as markdown (headings, code blocks and links kept), extracts PDF text per page, rewrites GitHub blob links to raw contents — through SSRF-guarded requests. With a prompt it answers questions about a page, reads YouTube videos, and transcribes scanned PDFs |
 
 [![CI](https://github.com/sehoon123/prime-agent-web/actions/workflows/ci.yml/badge.svg)](https://github.com/sehoon123/prime-agent-web/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -206,8 +206,34 @@ docs = await webfetch.fetch([url_a, url_b])                 # concurrent
 | `github.com/o/r/blob/…` | rewritten to `raw.githubusercontent.com` |
 | `github.com/o/r` | hint that `git clone` beats scraping HTML |
 
-Arguments: `mode` (`markdown`/`text`/`raw`), `max_chars` (rendered cap, default 20000),
-`max_pages`, `max_bytes` (default 10 MB), `respect_robots`, `timeout`.
+Arguments: `prompt`, `mode` (`markdown`/`text`/`raw`), `max_chars` (rendered cap,
+default 20000), `max_pages`, `max_bytes` (default 10 MB), `respect_robots`,
+`gemini`, `model`, `timeout`.
+
+### Model tiers (optional)
+
+Local extraction handles everything it can; Gemini is used only where it cannot.
+The endpoints are the ones `websearch` already discovered, so there is nothing extra
+to configure, and with no Gemini configured every local capability still works.
+
+```python
+await webfetch(url, prompt="Which auth methods does this API support?")
+await webfetch("https://youtu.be/abc123", prompt="What libraries are shown?")
+await webfetch("https://example.com/scan.pdf")   # no text layer -> transcribed
+await webfetch(url, gemini=False)                # stay local, always
+```
+
+| Situation | Tier | Why |
+|---|---|---|
+| YouTube link | `gemini-video` | no local path exists |
+| `prompt=`, or `gemini=True` | `gemini-url-context` | server-side fetch also reads JS-only and bot-blocked pages |
+| local fetch blocked or failed | `gemini-url-context` | recovers content instead of returning an error |
+| PDF with no text layer | `gemini-pdf` | a scan has nothing for pypdf to read |
+| anything else | local | no model call, no token cost |
+
+`doc.source` reports which tier answered; `doc.answer` holds the model text;
+`webfetch.gemini_available()` says whether the tiers are usable. A URL refused by the
+safety checks is never handed to the model either.
 
 **A readability-style extractor was measured and rejected.** On an API reference page
 it returned 1.7 KB with zero headings and zero links, against 25 KB with 62 code
@@ -270,14 +296,15 @@ cd prime-agent-web
 PYTHONPATH=skills/websearch/src:skills/webfetch/src python3 -m unittest discover -s tests -t .
 ```
 
-160 offline tests, no network and no credentials required (`httpx.MockTransport`),
+182 offline tests, no network and no credentials required (`httpx.MockTransport`),
 covering backend discovery (`models.json`, `key-rotator.json`, credential
 precedence and source reporting), every backend's request shape and response
 parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool
 fallback, citation markers, redirect resolution including SSRF rejection,
 DuckDuckGo rate-limit handling and both parsers, cache behaviour, rendering,
 redaction, URL validation and DNS preflight, redirect and size guards, robots.txt
-verdicts, HTML/PDF/binary extraction, and the Prime Agent skill contract itself for
+verdicts, HTML/PDF/binary extraction, Gemini tier routing and failover, and the
+Prime Agent skill contract itself for
 every skill in the package (including a reproduction of the kernel's module wrapper
 and a guard against helpers shadowing submodules).
 

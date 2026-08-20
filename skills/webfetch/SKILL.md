@@ -1,6 +1,6 @@
 ---
 name: webfetch
-description: Fetch a URL and read it as markdown, keeping headings, code blocks and link targets. Handles HTML, PDF (per-page text), JSON and other text formats, rewrites GitHub blob links to raw file contents, and saves binaries to a temp file. Use whenever a specific page, API reference, source file or paper must actually be read; use websearch first when the URL is unknown.
+description: Fetch a URL and read it as markdown, keeping headings, code blocks and link targets. Handles HTML, PDF (per-page text), JSON and other text formats, rewrites GitHub blob links to raw file contents, and saves binaries to a temp file. With a prompt it answers questions about a page, reads YouTube videos, and transcribes scanned PDFs through Gemini. Use whenever a specific page, API reference, source file, paper or video must actually be read; use websearch first when the URL is unknown.
 ---
 
 # Web Fetch
@@ -41,6 +41,36 @@ await webfetch(url, respect_robots=False)    # the user explicitly asked for thi
 help(webfetch)
 ```
 
+## Asking about a page, videos, scans
+
+These need a Gemini endpoint (the same one `websearch` discovers). Without one,
+everything above still works and these report why they cannot run.
+
+```python
+await webfetch(url, prompt="Which auth methods does this API support?")
+await webfetch("https://youtu.be/abc123", prompt="What libraries are shown?")
+await webfetch("https://example.com/scan.pdf")   # no text layer -> transcribed automatically
+await webfetch(url, gemini=False)                # never leave the local path
+await webfetch(url, gemini=True)                 # force the model path
+```
+
+A prompt routes through Gemini's `url_context` tool, which fetches server-side and
+therefore also reads pages that need JavaScript or block scripted clients. If that
+call fails, the local fetch runs instead and the reason is reported as a note.
+
+The model is used only where local extraction cannot work:
+
+| Situation | Tier |
+|---|---|
+| YouTube link | `gemini-video` (there is no local path) |
+| `prompt=` given, or `gemini=True` | `gemini-url-context` |
+| local fetch blocked or failed | `gemini-url-context` fallback |
+| PDF with no text layer | `gemini-pdf` transcription |
+| everything else | local, no model call |
+
+`doc.source` says which path produced the result, and `doc.answer` holds the model
+text. `webfetch.gemini_available()` reports whether these tiers are usable.
+
 Shell cell: `!webfetch https://example.com/page`
 
 ## What it does for you
@@ -78,6 +108,10 @@ every request is guarded:
 - `PRIME_AGENT_WEBFETCH_TIMEOUT` - HTTP timeout in seconds (default 45)
 - `PRIME_AGENT_WEBFETCH_RESPECT_ROBOTS` - `0` to skip robots.txt checks
 
+Gemini endpoints and keys come from the `websearch` skill's discovery
+(`models.json`, `auth.json`, optional `key-rotator.json`, `GEMINI_API_KEY`), so
+there is nothing extra to configure here. Pin the model with `model=` if needed.
+
 ## Notes
 
 - Errors never raise: `run()` returns a message and `fetch()` returns a Document
@@ -85,3 +119,4 @@ every request is guarded:
 - A large PDF fails with the exact `max_bytes=` value to retry with, instead of a
   library parse error.
 - For a whole repository, clone it (`git clone`) rather than fetching pages.
+- A URL refused by the safety checks is never handed to the model either.
