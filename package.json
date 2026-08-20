@@ -1,0 +1,41 @@
+{
+  "name": "prime-agent-websearch",
+  "version": "0.1.0",
+  "description": "Multi-backend web search skill for Prime Agent: Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, and keyless DuckDuckGo, auto-detected from the host's existing configuration.",
+  "keywords": [
+    "pi-package",
+    "prime-agent",
+    "prime-agent-skill",
+    "websearch",
+    "web-search",
+    "gemini-grounding",
+    "serper",
+    "tavily",
+    "brave-search",
+    "exa",
+    "searxng",
+    "duckduckgo"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sehoon123/prime-agent-websearch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sehoon123/prime-agent-websearch/issues"
+  },
+  "homepage": "https://github.com/sehoon123/prime-agent-websearch#readme",
+  "pi": {
+    "skills": [
+      "./skills/websearch"
+    ]
+  },
+  "files": [
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -t ."
+  }
+}

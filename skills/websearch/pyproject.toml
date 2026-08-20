@@ -1,0 +1,25 @@
+[project]
+# Deliberately the same distribution name as the skill bundled with Prime Agent:
+# this skill overrides it by name, so occupying the same distribution slot keeps
+# the `websearch` import unambiguous in the kernel venv.
+name = "prime-agent-skill-websearch"
+version = "0.1.0"
+description = "Multi-backend web search skill for Prime Agent (Gemini grounding, Tavily, Brave, Serper, Exa, SearXNG, DuckDuckGo)"
+readme = "SKILL.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+]
+
+[project.scripts]
+# The script name must match the Python import name exactly.
+websearch = "rlm.skill:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/websearch"]
