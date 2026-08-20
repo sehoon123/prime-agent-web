@@ -171,3 +171,94 @@ class KernelWrapperTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoShadowedSubmodulesTest(unittest.TestCase):
+    """A helper must never take the name of a sibling submodule.
+
+    `from .thing import x` plus `def thing(): ...` in the same `__init__.py` makes
+    `package.thing` the function, silently breaking `package.thing.y` for every
+    caller (and every test). This bit both skills in this repo, so it is checked
+    for all of them.
+    """
+
+    def test_no_module_attribute_shadows_a_submodule(self) -> None:
+        import importlib
+
+        for skill_dir in sorted((REPO_ROOT / "skills").iterdir()):
+            package_dir = skill_dir / "src" / skill_dir.name.replace("-", "_")
+            if not package_dir.is_dir():
+                continue
+            package = importlib.import_module(package_dir.name)
+            submodules = {
+                path.stem
+                for path in package_dir.glob("*.py")
+                if path.stem not in ("__init__", "__main__")
+            }
+            for name in sorted(submodules):
+                importlib.import_module(f"{package_dir.name}.{name}")
+                attribute = getattr(package, name, None)
+                self.assertTrue(
+                    attribute is None or inspect.ismodule(attribute),
+                    f"{package_dir.name}.{name} is {type(attribute).__name__}, not the submodule",
+                )
+
+
+class BothSkillsContractTest(unittest.TestCase):
+    """Every skill in the package must satisfy the Prime Agent detection contract."""
+
+    def skills(self) -> list[Path]:
+        return [path for path in sorted((REPO_ROOT / "skills").iterdir()) if (path / "SKILL.md").is_file()]
+
+    def test_all_skills_are_declared_in_the_manifest(self) -> None:
+        manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        declared = {entry.rstrip("/").split("/")[-1] for entry in manifest["pi"]["skills"]}
+        found = {path.name for path in self.skills()}
+        self.assertTrue(found)
+        # Either each skill is listed, or the skills/ directory is declared wholesale.
+        self.assertTrue(
+            found <= declared or declared == {"skills"},
+            f"skills {found - declared} are not declared in package.json",
+        )
+
+    def test_each_skill_satisfies_the_python_contract(self) -> None:
+        for skill in self.skills():
+            import_name = skill.name.replace("-", "_")
+            with self.subTest(skill=skill.name):
+                self.assertTrue((skill / "pyproject.toml").is_file())
+                self.assertTrue((skill / "src" / import_name / "__init__.py").is_file())
+                data = tomllib.loads((skill / "pyproject.toml").read_text(encoding="utf-8"))
+                project = data["project"]
+                self.assertEqual(list(project["scripts"]), [import_name])
+                self.assertEqual(project["scripts"][import_name], "rlm.skill:cli")
+                self.assertEqual(
+                    data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"],
+                    [f"src/{import_name}"],
+                )
+                self.assertNotIn("prime-agent-runtime", " ".join(project["dependencies"]))
+
+                text = (skill / "SKILL.md").read_text(encoding="utf-8")
+                self.assertTrue(text.startswith("---\n"))
+                frontmatter = text.split("---", 2)[1]
+                name = re.search(r"^name:\s*(.+)$", frontmatter, re.M)
+                description = re.search(r"^description:\s*(.+)$", frontmatter, re.M)
+                self.assertIsNotNone(name)
+                self.assertIsNotNone(description)
+                assert name and description
+                self.assertEqual(name.group(1).strip(), skill.name)
+                self.assertLessEqual(len(description.group(1).strip()), 500)
+
+    def test_each_skill_exposes_an_async_run(self) -> None:
+        import importlib
+
+        for skill in self.skills():
+            import_name = skill.name.replace("-", "_")
+            with self.subTest(skill=skill.name):
+                module = importlib.import_module(import_name)
+                self.assertTrue(inspect.iscoroutinefunction(module.run))
+                parameters = list(inspect.signature(module.run).parameters.values())
+                self.assertIs(parameters[0].default, inspect.Parameter.empty)
+                for parameter in parameters[1:]:
+                    self.assertIsNot(parameter.default, inspect.Parameter.empty)
+                for parameter in parameters:
+                    self.assertIsNot(parameter.annotation, inspect.Parameter.empty)

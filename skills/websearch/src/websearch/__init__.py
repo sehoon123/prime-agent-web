@@ -37,9 +37,9 @@ from .config import (
 )
 
 __all__ = ["run", "backends", "search", "SearchResult", "ResultItem", "Outcome", "clear_cache"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-_USER_AGENT = "prime-agent-websearch/0.2 (+https://github.com/sehoon123/prime-agent-websearch)"
+_USER_AGENT = "prime-agent-websearch/0.3 (+https://github.com/sehoon123/prime-agent-web)"
 
 # Repeated identical searches inside one kernel session are common in agent loops
 # (retries, reformulations, subagents). Cache them briefly to protect quota.

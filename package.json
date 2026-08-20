@@ -1,33 +1,40 @@
 {
-  "name": "prime-agent-websearch",
-  "version": "0.2.0",
-  "description": "Multi-backend web search skill for Prime Agent: Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, and keyless DuckDuckGo, with recency and domain filters, auto-detected from the host's existing configuration.",
+  "name": "prime-agent-web",
+  "version": "0.3.0",
+  "description": "Web access skills for Prime Agent: multi-backend search (Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, DuckDuckGo) and SSRF-guarded page fetching with HTML-to-markdown and PDF extraction.",
   "keywords": [
     "pi-package",
     "prime-agent",
     "prime-agent-skill",
     "websearch",
     "web-search",
+    "webfetch",
+    "fetch",
+    "html-to-markdown",
+    "pdf-extraction",
     "gemini-grounding",
     "serper",
     "tavily",
     "brave-search",
     "exa",
     "searxng",
-    "duckduckgo"
+    "duckduckgo",
+    "ai-agent",
+    "agent-skills"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sehoon123/prime-agent-websearch.git"
+    "url": "git+https://github.com/sehoon123/prime-agent-web.git"
   },
   "bugs": {
-    "url": "https://github.com/sehoon123/prime-agent-websearch/issues"
+    "url": "https://github.com/sehoon123/prime-agent-web/issues"
   },
-  "homepage": "https://github.com/sehoon123/prime-agent-websearch#readme",
+  "homepage": "https://github.com/sehoon123/prime-agent-web#readme",
   "pi": {
     "skills": [
-      "./skills/websearch"
+      "./skills/websearch",
+      "./skills/webfetch"
     ]
   },
   "files": [

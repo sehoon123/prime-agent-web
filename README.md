@@ -1,10 +1,14 @@
-# prime-agent-websearch
+# prime-agent-web
 
-**Multi-backend web search skill for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent).**
-Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, self-hosted SearXNG, or
-keyless DuckDuckGo — auto-detected from the configuration your agent already has.
+**Web access skills for [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent):
+search and fetch.** Two Python-backed skills in one package:
 
-[![CI](https://github.com/sehoon123/prime-agent-websearch/actions/workflows/ci.yml/badge.svg)](https://github.com/sehoon123/prime-agent-websearch/actions/workflows/ci.yml)
+| Skill | Call | What it does |
+|---|---|---|
+| `websearch` | `await websearch("query")` | Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, self-hosted SearXNG, or keyless DuckDuckGo — auto-detected from the configuration your agent already has |
+| `webfetch` | `await webfetch(url)` | reads a page as markdown (headings, code blocks and links kept), extracts PDF text per page, rewrites GitHub blob links to raw contents — through SSRF-guarded requests |
+
+[![CI](https://github.com/sehoon123/prime-agent-web/actions/workflows/ci.yml/badge.svg)](https://github.com/sehoon123/prime-agent-web/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 
@@ -64,8 +68,10 @@ and called from Python — per the
 ## Install
 
 ```bash
-prime-agent package install git:github.com/sehoon123/prime-agent-websearch
+prime-agent package install git:github.com/sehoon123/prime-agent-web
 ```
+
+That installs both skills.
 
 Restart Prime Agent (a fresh session installs the Python package into the kernel
 venv), then verify:
@@ -88,8 +94,8 @@ recency values: day, week, month, year
 cache: 300s in-process
 ```
 
-Local checkout instead: `prime-agent package install /path/to/prime-agent-websearch`.
-Remove with `prime-agent package remove git:github.com/sehoon123/prime-agent-websearch`.
+Local checkout instead: `prime-agent package install /path/to/prime-agent-web`.
+Remove with `prime-agent package remove git:github.com/sehoon123/prime-agent-web`.
 
 ### Replacing the built-in skill
 
@@ -182,6 +188,32 @@ If a [pi-api-key-rotator](https://github.com/sehoon123/pi-api-key-rotator) style
 become failover candidates: `401`/`403`/`429` moves to the next key, then the next
 endpoint, then the next backend.
 
+## webfetch
+
+```python
+print(await webfetch("https://docs.example.com/guide"))     # markdown
+doc = await webfetch.fetch("https://arxiv.org/pdf/2605.09998", max_bytes=40_000_000)
+doc.text[20_000:40_000]                                     # slice in the kernel, no refetch
+docs = await webfetch.fetch([url_a, url_b])                 # concurrent
+```
+
+| Input | Result |
+|---|---|
+| HTML | markdown with headings, code blocks and link targets kept; `script`/`nav`/`header`/`footer`/`aside` dropped; content taken from `<main>`/`<article>` when present |
+| PDF | per-page text with `--- page N ---` markers, page count, metadata title; scanned PDFs reported as having no text layer |
+| JSON / YAML / text | returned as served (`mode="raw"` for exact bytes) |
+| images, archives | saved to a temp file, path reported |
+| `github.com/o/r/blob/…` | rewritten to `raw.githubusercontent.com` |
+| `github.com/o/r` | hint that `git clone` beats scraping HTML |
+
+Arguments: `mode` (`markdown`/`text`/`raw`), `max_chars` (rendered cap, default 20000),
+`max_pages`, `max_bytes` (default 10 MB), `respect_robots`, `timeout`.
+
+**A readability-style extractor was measured and rejected.** On an API reference page
+it returned 1.7 KB with zero headings and zero links, against 25 KB with 62 code
+blocks from the conservative pipeline used here. Aggressive main-content extraction
+is tuned for news articles and destroys developer documentation.
+
 ## Environment overrides
 
 | Variable | Default | Purpose |
@@ -194,6 +226,10 @@ endpoint, then the next backend.
 | `PRIME_AGENT_WEBSEARCH_KEY_ROTATOR` | `<agent dir>/key-rotator.json` | path to a key-rotator config |
 | `SEARXNG_URL` | unset | SearXNG instance base URL |
 | `PRIME_AGENT_CODING_AGENT_DIR` | `~/.prime/agent` | config directory to read (`~/.pi/agent` is a fallback) |
+| `PRIME_AGENT_WEBFETCH_MAX_CHARS` | `20000` | webfetch rendered output cap; `0` disables |
+| `PRIME_AGENT_WEBFETCH_MAX_BYTES` | `10485760` | webfetch body size cap |
+| `PRIME_AGENT_WEBFETCH_TIMEOUT` | `45` | webfetch HTTP timeout in seconds |
+| `PRIME_AGENT_WEBFETCH_RESPECT_ROBOTS` | `1` | `0` skips robots.txt checks |
 
 Credential values follow Prime Agent's own rules: an environment variable name
 resolves to that variable, otherwise the value is used literally. `!command`
@@ -212,6 +248,11 @@ See [SECURITY.md](SECURITY.md). Summary:
   credential's source, never its value.
 - Search results are untrusted third-party text; treat snippets as data, not
   instructions.
+- `webfetch` guards every request: http(s) only, no credentials in URLs, private and
+  metadata targets refused, **DNS preflight** so a hostname resolving into private
+  space is caught, manual redirect following with re-validation of every hop, size
+  caps enforced from `content-length` and again while streaming, and `robots.txt`
+  honoured by default for autonomous fetches.
 
 ## Compatibility
 
@@ -224,34 +265,42 @@ See [SECURITY.md](SECURITY.md). Summary:
 ## Development
 
 ```bash
-git clone https://github.com/sehoon123/prime-agent-websearch
-cd prime-agent-websearch
-PYTHONPATH=skills/websearch/src python3 -m unittest discover -s tests -t .
+git clone https://github.com/sehoon123/prime-agent-web
+cd prime-agent-web
+PYTHONPATH=skills/websearch/src:skills/webfetch/src python3 -m unittest discover -s tests -t .
 ```
 
-98 offline tests, no network and no credentials required (`httpx.MockTransport`),
+160 offline tests, no network and no credentials required (`httpx.MockTransport`),
 covering backend discovery (`models.json`, `key-rotator.json`, credential
 precedence and source reporting), every backend's request shape and response
 parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool
 fallback, citation markers, redirect resolution including SSRF rejection,
 DuckDuckGo rate-limit handling and both parsers, cache behaviour, rendering,
-redaction, and the Prime Agent skill contract itself (including a reproduction of
-the kernel's module wrapper).
+redaction, URL validation and DNS preflight, redirect and size guards, robots.txt
+verdicts, HTML/PDF/binary extraction, and the Prime Agent skill contract itself for
+every skill in the package (including a reproduction of the kernel's module wrapper
+and a guard against helpers shadowing submodules).
 
 Standalone smoke test outside the kernel:
 
 ```bash
 PYTHONPATH=skills/websearch/src python3 -m websearch            # list backends
 PYTHONPATH=skills/websearch/src python3 -m websearch "a query"  # real search
+PYTHONPATH=skills/webfetch/src  python3 -m webfetch https://example.com
 ```
 
 ## Credits
 
-Design informed by [pi-web-access](https://github.com/nicobailon/pi-web-access) by
-Nico Bailon — the equivalent capability for the pi agent, and the source of the
-provider-precedence, filter-mapping, and redirect-resolution patterns adapted here.
-That extension is a tool-based design for a many-tool host; this package is a
-skill-based design for a one-tool host.
+Design informed by two references:
+
+- [pi-web-access](https://github.com/nicobailon/pi-web-access) by Nico Bailon — the
+  equivalent capability for the pi agent. Source of the provider-precedence,
+  filter-mapping, redirect-resolution, `content-length` pre-check and explicit
+  size-limit error patterns adapted here. That extension is a tool-based design for
+  a many-tool host; this package is a skill-based design for a one-tool host.
+- The official [MCP fetch server](https://github.com/modelcontextprotocol/servers/tree/main/src/fetch)
+  — source of the robots.txt convention (autonomous vs user-specified user agents,
+  `401`/`403` treated as a refusal) and the markdownify-based extraction approach.
 
 ## License
 

@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-20
+
+### Added
+
+- **`webfetch` skill**: fetch a URL and read it as markdown. The package now ships
+  two skills and is renamed `prime-agent-web`.
+  - HTML to markdown keeping headings, code blocks and link targets; boilerplate
+    (`script`, `style`, `nav`, `header`, `footer`, `aside`, `form`, `iframe`) removed
+    and content taken from `<main>`/`<article>` when present.
+  - PDF text per page with `--- page N ---` markers, page count and metadata title;
+    scanned PDFs are reported as having no text layer.
+  - `mode="raw"` for exact bodies, `mode="text"` for plain text.
+  - Binaries written to a temp file with the path reported.
+  - `github.com/o/r/blob/…` rewritten to `raw.githubusercontent.com`; a repository
+    root gets a `git clone` hint instead of scraped HTML.
+  - `fetch()` returns `Document` objects with the full text and fetches lists of
+    URLs concurrently; `run()` renders a bounded view and never raises.
+- SSRF guards for fetching: http(s) only, no credentials in URLs, private, loopback,
+  link-local, metadata and bare-internal targets refused, **DNS preflight** on every
+  hostname, manual redirect following (max 5 hops) with re-validation of each hop.
+- Size guards: `content-length` over the cap is rejected before download, a streaming
+  guard cuts off unannounced bodies, and an oversized PDF fails with the exact
+  `max_bytes=` value to retry with.
+- `robots.txt` honoured by default for autonomous fetches, using the convention of
+  the official MCP fetch server (Autonomous vs User-Specified user agents, `401`/`403`
+  treated as a refusal), implemented with the standard library so it costs no
+  dependency. `respect_robots=False` overrides it.
+- `transport` injection point on `webfetch.fetch()` for tests and custom networking.
+- Contract test that no module attribute shadows a sibling submodule, and that every
+  skill in the package satisfies the Prime Agent detection contract.
+
+### Changed
+
+- Package renamed from `prime-agent-websearch` to `prime-agent-web`; both skills are
+  versioned 0.3.0. GitHub redirects the old repository URL.
+- A readability-style extractor was evaluated and **rejected** on measurements: on an
+  API reference page it produced 1.7 KB with zero headings and zero links, against
+  25 KB with 62 code blocks from the conservative pipeline that shipped.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added
