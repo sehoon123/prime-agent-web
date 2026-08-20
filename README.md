@@ -229,7 +229,7 @@ cd prime-agent-websearch
 PYTHONPATH=skills/websearch/src python3 -m unittest discover -s tests -t .
 ```
 
-97 offline tests, no network and no credentials required (`httpx.MockTransport`),
+98 offline tests, no network and no credentials required (`httpx.MockTransport`),
 covering backend discovery (`models.json`, `key-rotator.json`, credential
 precedence and source reporting), every backend's request shape and response
 parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool

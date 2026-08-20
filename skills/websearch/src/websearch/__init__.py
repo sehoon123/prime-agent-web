@@ -79,6 +79,15 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
+def _now() -> float:
+    """Monotonic clock, indirected so tests can control cache expiry exactly.
+
+    `time.monotonic()` counts from an arbitrary origin (uptime on Linux), so a
+    test must never assume a specific absolute value.
+    """
+    return time.monotonic()
+
+
 def _cache_get(key: tuple[Any, ...], ttl: float) -> Optional[Outcome]:
     if ttl <= 0:
         return None
@@ -86,7 +95,7 @@ def _cache_get(key: tuple[Any, ...], ttl: float) -> Optional[Outcome]:
     if not entry:
         return None
     stored_at, outcome = entry
-    if time.monotonic() - stored_at > ttl:
+    if _now() - stored_at > ttl:
         _CACHE.pop(key, None)
         return None
     return outcome
@@ -98,7 +107,7 @@ def _cache_put(key: tuple[Any, ...], outcome: Outcome, ttl: float) -> None:
     if len(_CACHE) >= _CACHE_MAX_ENTRIES:
         oldest = min(_CACHE, key=lambda existing: _CACHE[existing][0])
         _CACHE.pop(oldest, None)
-    _CACHE[key] = (time.monotonic(), outcome)
+    _CACHE[key] = (_now(), outcome)
 
 
 async def _attempt(

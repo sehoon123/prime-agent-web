@@ -45,6 +45,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lite endpoint.
 - Citation markers no longer land after a trailing space when a provider's segment
   offsets include it.
+- Cache expiry now reads the clock through an injectable `_now()` helper. The TTL
+  test previously forced expiry by writing an absolute `0.0` timestamp, which is
+  wrong because `time.monotonic()` counts from an arbitrary origin (uptime on
+  Linux): on a freshly booted CI runner the entry still looked fresh.
 
 ### Security
 

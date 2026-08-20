@@ -185,14 +185,27 @@ class CacheTest(unittest.IsolatedAsyncioTestCase):
         await websearch.run("q")
         self.assertEqual(len(calls), 2)
 
+    async def test_entry_within_ttl_is_reused(self) -> None:
+        calls = self.install("300")
+        clock = [1_000.0]
+        with mock.patch.object(websearch, "_now", lambda: clock[0]):
+            await websearch.run("q")
+            clock[0] += 299.0  # still inside the 300s window
+            text = await websearch.run("q")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("from cache", text)
+
     async def test_expired_entry_is_refetched(self) -> None:
         calls = self.install("300")
-        await websearch.run("q")
-        # Age every entry past the TTL.
-        for key, (_, outcome) in list(websearch._CACHE.items()):
-            websearch._CACHE[key] = (0.0, outcome)
-        await websearch.run("q")
+        # A fake clock: time.monotonic() counts from an arbitrary origin (uptime),
+        # so absolute values must never be assumed - only deltas.
+        clock = [1_000.0]
+        with mock.patch.object(websearch, "_now", lambda: clock[0]):
+            await websearch.run("q")
+            clock[0] += 301.0  # past the 300s TTL
+            text = await websearch.run("q")
         self.assertEqual(len(calls), 2)
+        self.assertNotIn("from cache", text)
 
 
 class RenderingTest(unittest.IsolatedAsyncioTestCase):
