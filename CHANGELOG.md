@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-08-22
+
+### Fixed
+
+- Replaced the robots wildcard retry loop with ordered native substring searches.
+  The old heuristic work counter could admit a short-looking pattern that then took
+  seconds to reject; the simpler matcher preserves `*` and terminal `$` behavior
+  without regex backtracking, while the aggregate work limit now reflects its actual
+  linear scan cost.
+- Corrected `run()` documentation: raw mode returns decoded, otherwise unprocessed
+  text rather than the transfer bytes exactly as served.
+
+### Changed
+
+- Removed parser limits already implied by the bounded 1 MiB robots input, collapsed
+  duplicated configuration-file and basic-auth parsing, and reduced cache fingerprints
+  to one process-keyed BLAKE2 digest. Public APIs, cache boundaries, and health behavior
+  are unchanged.
+
 ## [0.6.2] - 2026-08-21
 
 ### Fixed
@@ -71,8 +90,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   batch results. DNS, robots and file-processing waits obey caller timeouts, malformed
   ports are rejected, HTML meta charsets are honored, and user-facing `run()` calls
   keep their never-raise contract for invalid argument types. Robots parses the bounded
-  RFC prefix and uses longest-match/Allow precedence, linear work-bounded wildcards,
-  anchors, and equivalent Unicode/UTF-8 percent normalization off the event loop.
+  RFC prefix and uses longest-match/Allow precedence, non-regex wildcards, anchors,
+  and equivalent Unicode/UTF-8 percent normalization off the event loop.
   Explicit prompts or `gemini=True` now return a clear model error instead of caching
   a local dump that did not satisfy the request.
 

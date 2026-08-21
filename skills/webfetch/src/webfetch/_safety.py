@@ -29,10 +29,10 @@ MAX_URL_CHARS = 8192
 # Identify the client and its autonomy, following the convention used by the
 # official MCP fetch server so operators can recognise agent traffic in logs.
 USER_AGENT_AUTONOMOUS = (
-    "prime-agent-webfetch/0.6.2 (Autonomous; +https://github.com/sehoon123/prime-agent-web)"
+    "prime-agent-webfetch/0.6.3 (Autonomous; +https://github.com/sehoon123/prime-agent-web)"
 )
 USER_AGENT_MANUAL = (
-    "prime-agent-webfetch/0.6.2 (User-Specified; +https://github.com/sehoon123/prime-agent-web)"
+    "prime-agent-webfetch/0.6.3 (User-Specified; +https://github.com/sehoon123/prime-agent-web)"
 )
 
 _BLOCKED_HOSTS = frozenset(

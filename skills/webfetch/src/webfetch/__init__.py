@@ -69,7 +69,7 @@ __all__ = [
     "TooLargeError",
     "gemini_available",
 ]
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 MODES = ("markdown", "text", "raw")
 DEFAULT_MAX_CHARS = 20_000
@@ -368,8 +368,6 @@ async def _fetch_one(
             _gemini.answer_about_url(client, target, prompt or "Summarise this page.", model=model, timeout=timeout),
             notes,
         )
-        if document.ok:
-            return document
         # A local page dump does not satisfy an explicit question or forced-model
         # request, and caching it would suppress a later recovery after 429/5xx.
         return document
@@ -740,8 +738,8 @@ async def run(
             Gemini's url_context tool, which also reaches pages that need JavaScript
             or block scripted clients.
         mode: "markdown" (default) converts HTML while keeping headings, code blocks
-            and link targets; "text" returns plain text; "raw" returns the body
-            exactly as served, for JSON and other machine formats.
+            and link targets; "text" returns plain text; "raw" returns decoded but
+            otherwise unprocessed text for JSON and other machine formats.
         max_chars: Truncate the rendered output (default 20000, 0 disables). The full
             text is always available through `webfetch.fetch(url)`.
         max_pages: For PDFs, extract only the first N pages.

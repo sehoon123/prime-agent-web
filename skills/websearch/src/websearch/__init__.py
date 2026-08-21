@@ -60,9 +60,9 @@ __all__ = [
     "Outcome",
     "clear_cache",
 ]
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
-_USER_AGENT = "prime-agent-websearch/0.6.2 (+https://github.com/sehoon123/prime-agent-web)"
+_USER_AGENT = "prime-agent-websearch/0.6.3 (+https://github.com/sehoon123/prime-agent-web)"
 
 # Session-scoped backend health, refined from what actually happened here.
 _HEALTH = _health.HealthTracker()
@@ -138,14 +138,11 @@ def _decode_control_entities(text: str) -> str:
     return _ENTITY.sub(replace, text)
 
 
-def _replace_secret(text: str, secret: str) -> str:
-    return text.replace(secret, "***") if secret else text
-
-
 def _redact(text: str, secrets: Sequence[str]) -> str:
     """Replace credentials longest-first and remove terminal control bytes."""
     for secret in sorted(set(secrets), key=len, reverse=True):
-        text = _replace_secret(text, secret)
+        if secret:
+            text = text.replace(secret, "***")
     text = _decode_control_entities(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u2028", "\n").replace("\u2029", "\n").replace("\t", " ")
@@ -188,13 +185,10 @@ def _configuration_fingerprint(settings: Settings, eligible: Sequence[str]) -> s
         )
     if "searxng" in eligible:
         material.append(("searxng", settings.searxng_url))
-    credentials = hashlib.blake2s(key=_CACHE_DIGEST_KEY, digest_size=16)
-    for secret in settings.secrets:
-        encoded = secret.encode("utf-8")
-        credentials.update(len(encoded).to_bytes(8, "big"))
-        credentials.update(encoded)
-    material.append(("credential-identity", credentials.hexdigest()))
-    return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()[:16]
+    material.append(("credentials", settings.secrets))
+    return hashlib.blake2s(
+        repr(material).encode("utf-8"), key=_CACHE_DIGEST_KEY, digest_size=8
+    ).hexdigest()
 
 
 def _cache_get(key: tuple[Any, ...], ttl: float) -> Optional[Outcome]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import random
+import time
 import unittest
 from typing import Any, Callable, Sequence
 
@@ -496,7 +497,7 @@ Allow: /
 class RobotsTest(unittest.IsolatedAsyncioTestCase):
     def cache(self) -> RobotsCache:
         return RobotsCache(
-            user_agent="prime-agent-webfetch/0.6.2 (Autonomous; +https://example.invalid)",
+            user_agent="prime-agent-webfetch/0.6.3 (Autonomous; +https://example.invalid)",
             resolver=public_resolver,
         )
 
@@ -570,13 +571,26 @@ Disallow: /same$
             )
         self.assertTrue(verdict.allowed)
 
-    def test_match_work_budget_fails_closed(self) -> None:
-        body = "User-agent: *\n" + "Disallow: /*Z\n" * 32 + "Disallow: /a\n"
-        policy = _robots._parse_policy(body)
-        target = "https://example.com/" + "a" * 8000
-        self.assertIsNone(policy.can_fetch(self.cache().user_agent, target))
+    def test_long_literal_after_wildcard_is_fast_and_correct(self) -> None:
+        pattern = "/*" + "a" * 8000 + "b"
+        policy = _robots._parse_policy(f"User-agent: *\nDisallow: {pattern}\n")
+        target = "https://example.com/" + "a" * 8000 + "c"
+        started = time.perf_counter()
+        self.assertTrue(policy.can_fetch(self.cache().user_agent, target))
+        self.assertLess(time.perf_counter() - started, 0.5)
 
-    def test_long_url_with_many_plain_rules_does_not_exhaust_budget(self) -> None:
+    async def test_aggregate_match_work_is_bounded_after_unicode_normalization(self) -> None:
+        body = "User-agent: *\n" + "Disallow: /*%90X\n" * 3
+        base = "https://example.com/"
+        target = base + "𐐐" * (8192 - len(base))
+        async with client_for(lambda request: httpx.Response(200, text=body)) as client:
+            started = time.perf_counter()
+            verdict = await self.cache().check(client, target)
+        self.assertFalse(verdict.allowed)
+        self.assertIn("work budget", verdict.reason)
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_long_url_with_many_plain_rules_remains_allowed(self) -> None:
         body = (
             "User-agent: *\n"
             + "".join(f"Disallow: /admin/section-{index}/\n" for index in range(600))

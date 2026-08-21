@@ -114,9 +114,9 @@ every request is guarded:
   responses have their own cap
 - `robots.txt` is honoured by default for autonomous fetches, following the
   convention of the official MCP fetch server, with `401`/`403` on robots.txt read
-  as a refusal. Parsing is limited to a 1 MiB prefix; matching has a bounded work
-  budget and denies conservatively if that budget is exhausted. Pass
-  `respect_robots=False` when a human asked for the page. For
+  as a refusal. Parsing is limited to a 1 MiB prefix; wildcard matching uses ordered
+  native substring searches rather than regex backtracking and fails closed at its
+  aggregate work limit. Pass `respect_robots=False` when a human asked for the page. For
   Gemini's opaque server-side URL retrieval, this check covers the submitted URL;
   provider-internal redirects cannot be inspected locally.
 

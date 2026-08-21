@@ -24,8 +24,6 @@ from ._safety import FetchError, Resolver, TooLargeError, UnsafeUrlError, guarde
 
 ROBOTS_TIMEOUT = 10.0
 MAX_ROBOTS_BYTES = 1_000_000
-MAX_ROBOTS_RULES = MAX_ROBOTS_BYTES
-MAX_ROBOTS_PATTERN_CHARS = MAX_ROBOTS_BYTES
 MAX_ROBOTS_MATCH_WORK = 250_000
 _UNRESERVED = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
@@ -63,36 +61,35 @@ class _Rule:
     allow: bool
 
     def matches(self, target: str) -> bool:
-        """Match `*` in linear time; unanchored rules match a path prefix."""
+        """Match `*` with ordered native substring searches."""
         pattern = self.pattern
-        pattern_index = target_index = 0
-        star_index = -1
-        retry_target = 0
-        while target_index < len(target):
-            if (
-                pattern_index < len(pattern)
-                and pattern[pattern_index] != "*"
-                and pattern[pattern_index] == target[target_index]
-            ):
-                pattern_index += 1
-                target_index += 1
-                if not self.anchored and pattern_index == len(pattern):
-                    return True
-            elif pattern_index < len(pattern) and pattern[pattern_index] == "*":
-                star_index = pattern_index
-                pattern_index += 1
-                retry_target = target_index
-                if not self.anchored and pattern_index == len(pattern):
-                    return True
-            elif star_index >= 0:
-                retry_target += 1
-                target_index = retry_target
-                pattern_index = star_index + 1
-            else:
+        if "*" not in pattern:
+            return target == pattern if self.anchored else target.startswith(pattern)
+
+        parts = pattern.split("*")
+        position = 0
+        if parts[0]:
+            if not target.startswith(parts[0]):
                 return False
-        while pattern_index < len(pattern) and pattern[pattern_index] == "*":
-            pattern_index += 1
-        return pattern_index == len(pattern)
+            position = len(parts[0])
+
+        literals = [part for part in parts[1:] if part]
+        for index, literal in enumerate(literals):
+            is_last = index == len(literals) - 1
+            if self.anchored and is_last and not pattern.endswith("*"):
+                start = len(target) - len(literal)
+                if start < position or not target.endswith(literal):
+                    return False
+                position = len(target)
+            else:
+                found = target.find(literal, position)
+                if found < 0:
+                    return False
+                position = found + len(literal)
+
+        if self.anchored and not pattern.endswith("*") and not literals:
+            return position == len(target)
+        return True
 
 
 @dataclass
@@ -126,12 +123,9 @@ class _Policy:
         matches: list[_Rule] = []
         work = 0
         for rule in selected:
-            # A plain prefix rule can inspect at most its own pattern length.
-            # A wildcard followed by more text may scan the target while retrying.
+            # The native matcher scans each literal and target at most linearly.
             work += len(rule.pattern)
-            if "*" in rule.pattern and not (
-                not rule.anchored and rule.pattern.endswith("*")
-            ):
+            if "*" in rule.pattern:
                 work += len(target)
             if work > MAX_ROBOTS_MATCH_WORK:
                 return None
@@ -164,16 +158,14 @@ def _parse_policy(text: str) -> _Policy:
     agents: list[str] = []
     rules: list[_Rule] = []
     saw_rule = False
-    rule_count = 0
 
     def finish() -> None:
-        nonlocal agents, rules, saw_rule, rule_count
+        nonlocal agents, rules, saw_rule
         if agents:
             groups.append((tuple(agents), tuple(rules)))
         agents = []
         rules = []
         saw_rule = False
-        rule_count = 0
 
     for raw_line in text.lstrip("\ufeff").splitlines():
         line = raw_line.split("#", 1)[0].strip()
@@ -189,12 +181,9 @@ def _parse_policy(text: str) -> _Policy:
                 agents.append(value.lower())
         elif field_name in ("allow", "disallow") and agents:
             saw_rule = True
-            if len(value) > MAX_ROBOTS_PATTERN_CHARS or rule_count >= MAX_ROBOTS_RULES:
-                continue
             rule = _compile_rule(value, field_name == "allow")
             if rule is not None:
                 rules.append(rule)
-                rule_count += 1
     finish()
     return _Policy(groups)
 

@@ -1,6 +1,6 @@
 {
   "name": "prime-agent-web",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Web access skills for Prime Agent: multi-backend search (Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, DuckDuckGo) and SSRF-guarded page fetching with HTML-to-markdown, PDF extraction, page Q&A, video reading and scan transcription.",
   "keywords": [
     "pi-package",

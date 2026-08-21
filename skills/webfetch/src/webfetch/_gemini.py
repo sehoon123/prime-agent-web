@@ -22,6 +22,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -66,8 +67,6 @@ class GeminiAnswer:
 
 
 def is_video_url(url: str) -> bool:
-    from urllib.parse import urlsplit
-
     parts = urlsplit(url)
     host = (parts.hostname or "").lower()
     if host in ("youtu.be", "www.youtu.be"):
@@ -113,18 +112,13 @@ def cache_fingerprint() -> str:
             str(getattr(endpoint, "label", "")),
             str(getattr(endpoint, "base_url", "")),
             tuple(getattr(endpoint, "models", ())),
+            tuple(str(key) for key in getattr(endpoint, "keys", ())),
         )
         for endpoint in endpoints
     )
-    credentials = hashlib.blake2s(key=_CACHE_DIGEST_KEY, digest_size=16)
-    for endpoint in endpoints:
-        for secret in getattr(endpoint, "keys", ()):
-            encoded = str(secret).encode("utf-8")
-            credentials.update(len(encoded).to_bytes(8, "big"))
-            credentials.update(encoded)
-    return hashlib.sha256(
-        repr((material, credentials.hexdigest())).encode("utf-8")
-    ).hexdigest()[:16]
+    return hashlib.blake2s(
+        repr(material).encode("utf-8"), key=_CACHE_DIGEST_KEY, digest_size=8
+    ).hexdigest()
 
 
 def _extract_text(payload: dict[str, Any]) -> tuple[str, list[str]]:
@@ -161,8 +155,6 @@ def _extract_text(payload: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def _endpoint_secrets(endpoints: Sequence[Any]) -> tuple[str, ...]:
-    from urllib.parse import unquote, urlsplit
-
     values: list[str] = []
     for endpoint in endpoints:
         values.extend(str(key) for key in getattr(endpoint, "keys", ()) if key)
@@ -175,13 +167,10 @@ def _endpoint_secrets(endpoints: Sequence[Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _redact_secret(text: str, secret: str) -> str:
-    return text.replace(secret, "***") if secret else text
-
-
 def _redact_secrets(text: str, secrets: Sequence[str]) -> str:
     for secret in sorted(set(secrets), key=len, reverse=True):
-        text = _redact_secret(text, secret)
+        if secret:
+            text = text.replace(secret, "***")
     return text
 
 

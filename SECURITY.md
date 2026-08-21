@@ -61,7 +61,9 @@ response bodies are bounded. Webfetch also bounds redirect depth, transfer-decod
 page bytes, Gemini and Files responses, and rendered output; both caches are bounded.
 CPU-heavy HTML/PDF and robots parsing/matching run in worker threads. A one-byte
 streaming look-ahead detects truncation without retaining an arbitrarily large decoded
-chunk; robots matching denies when its aggregate work budget is exhausted.
+chunk; robots wildcards use ordered native substring searches rather than regex or a
+retrying character-by-character loop, and aggregate matching fails closed before its
+bounded work limit is exceeded.
 
 **Cache and files.** Successful values are copied into bounded, TTL-based process
 memory caches; credential rotation is part of each cache boundary. Errors, mutable

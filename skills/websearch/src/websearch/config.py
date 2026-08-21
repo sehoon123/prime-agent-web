@@ -19,6 +19,7 @@ from functools import cached_property
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
+from urllib.parse import unquote, urlsplit
 
 # Single source of truth lives in _health.py; this alias keeps the settings
 # layer from drifting away from what health() reports.
@@ -134,20 +135,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def read_first_json(filename: str) -> dict[str, Any]:
     """Read `filename` from the selected agent directory."""
-    for directory in agent_dirs():
-        path = directory / filename
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if text.startswith("\ufeff"):
-            text = text[1:]
-        try:
-            data = json.loads(text)
-        except ValueError:
-            return {}
-        return data if isinstance(data, dict) else {}
-    return {}
+    return read_json(agent_dirs()[0] / filename)
 
 
 def resolve_secret(raw: Any) -> Optional[str]:
@@ -213,6 +201,14 @@ def _dedupe(values: Iterable[Optional[str]]) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _basic_auth_passwords(url: str) -> tuple[str, ...]:
+    try:
+        password = urlsplit(url).password
+    except ValueError:
+        return ()
+    return _dedupe((password, unquote(password))) if password else ()
+
+
 # --------------------------------------------------------------------------- #
 # URL safety
 # --------------------------------------------------------------------------- #
@@ -223,8 +219,6 @@ _BLOCKED_HOSTS = frozenset({"localhost", "localhost.localdomain", "metadata", "m
 
 def safe_endpoint_label(url: str) -> str:
     """Describe a configured URL without exposing embedded basic-auth data."""
-    from urllib.parse import urlsplit
-
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -262,8 +256,6 @@ def is_public_http_url(url: str) -> bool:
     before they are shown or followed, so a redirect can never point the agent at
     loopback, link-local metadata services, or private ranges.
     """
-    from urllib.parse import urlsplit
-
     if not isinstance(url, str) or len(url) > MAX_RESULT_URL_CHARS:
         return False
     decoded_url = html.unescape(url)
@@ -312,8 +304,6 @@ def is_public_http_url(url: str) -> bool:
 
 def normalize_domain(raw: str) -> Optional[str]:
     """Turn user input into a bare hostname: '-https://Example.com/docs' -> 'example.com'."""
-    from urllib.parse import urlsplit
-
     value = (raw or "").strip().lstrip("-").strip()
     if not value:
         return None
@@ -397,8 +387,6 @@ class SearchQuery:
         """Client-side domain filter, applied to every backend as a safety net."""
         if not self.include_domains and not self.exclude_domains:
             return True
-        from urllib.parse import urlsplit
-
         try:
             hostname = urlsplit(url).hostname or ""
         except ValueError:
@@ -638,27 +626,13 @@ class Settings:
         values: list[str] = []
         for endpoint in self.gemini_endpoints:
             values.extend(endpoint.keys)
-            from urllib.parse import unquote, urlsplit
-
-            try:
-                parts = urlsplit(endpoint.base_url)
-                if parts.password:
-                    values.extend((parts.password, unquote(parts.password)))
-            except ValueError:
-                pass
+            values.extend(_basic_auth_passwords(endpoint.base_url))
         for name in _SIMPLE_CREDENTIALS:
             found = self.find_simple(name)
             if found:
                 values.append(found.value)
         if self.searxng_url:
-            from urllib.parse import unquote, urlsplit
-
-            try:
-                parts = urlsplit(self.searxng_url)
-                if parts.password:
-                    values.extend((parts.password, unquote(parts.password)))
-            except ValueError:
-                pass
+            values.extend(_basic_auth_passwords(self.searxng_url))
         return _dedupe(values)
 
     @cached_property
