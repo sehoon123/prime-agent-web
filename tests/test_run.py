@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
+from dataclasses import replace
 from typing import Any
 from unittest import mock
 
@@ -28,10 +30,15 @@ def result(backend: str, url: str = "https://example.com", **overrides: Any) -> 
 class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         websearch.clear_cache()
+        websearch.reset_health()
         patcher = mock.patch.object(config, "read_first_json", return_value={})
         self.addCleanup(patcher.stop)
         patcher.start()
-        env = mock.patch.dict(os.environ, {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "0"}, clear=True)
+        env = mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "0", "PRIME_AGENT_WEBSEARCH_COOLDOWN": "0"},
+            clear=True,
+        )
         self.addCleanup(env.stop)
         env.start()
 
@@ -48,7 +55,7 @@ class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(available.stop)
         available.start()
 
-    async def test_auto_stops_at_first_success(self) -> None:
+    async def test_restricted_fanout_keeps_success_and_failure(self) -> None:
         calls: list[str] = []
 
         async def failing(client: httpx.AsyncClient, query: config.SearchQuery, settings: config.Settings) -> Any:
@@ -66,6 +73,22 @@ class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["gemini", "ddg"])
         self.assertIn("## ddg", text)
         self.assertIn("failed: gemini", text)
+
+    async def test_auto_stops_at_first_success(self) -> None:
+        calls: list[str] = []
+
+        async def working(client: Any, query: Any, settings: Any) -> Any:
+            calls.append("gemini")
+            return result("gemini")
+
+        async def must_not_run(client: Any, query: Any, settings: Any) -> Any:
+            calls.append("ddg")
+            raise AssertionError("auto must stop after the first result")
+
+        self.fake_backends(gemini=working, ddg=must_not_run)
+        text = await websearch.run("q", provider="auto")
+        self.assertEqual(calls, ["gemini"])
+        self.assertIn("## gemini", text)
 
     async def test_all_runs_backends_concurrently(self) -> None:
         started: list[str] = []
@@ -126,6 +149,98 @@ class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await websearch.search("q", recency="fortnight")
 
+    async def test_backend_name_is_not_duplicated_in_failures(self) -> None:
+        async def failing(client: Any, query: Any, settings: Any) -> Any:
+            raise backends.BackendError("gemini returned HTTP 429")
+
+        self.fake_backends(gemini=failing)
+        text = await websearch.run("q", provider="gemini")
+        self.assertIn("gemini returned HTTP 429", text)
+        self.assertNotIn("gemini: gemini", text)
+
+    def test_query_header_is_single_line_and_bidi_safe(self) -> None:
+        self.assertEqual(websearch._single_line("q\nFAKE\u202e"), "q FAKE")
+        self.assertEqual(websearch._single_line("q&#x202e;FAKE"), "q FAKE")
+        self.assertEqual(
+            websearch._single_line("👨\u200d👩\u200d👧"), "👨\u200d👩\u200d👧"
+        )
+
+    def test_configuration_fingerprint_changes_when_key_rotates(self) -> None:
+        from types import SimpleNamespace
+
+        common = {"gemini_endpoints": (), "searxng_url": None}
+        first = SimpleNamespace(**common, secrets=("KEY-A",))
+        second = SimpleNamespace(**common, secrets=("KEY-B",))
+        self.assertNotEqual(
+            websearch._configuration_fingerprint(first, ("tavily",)),
+            websearch._configuration_fingerprint(second, ("tavily",)),
+        )
+
+    def test_basic_username_is_not_a_bearer_redaction_value(self) -> None:
+        settings = config.Settings(
+            num_results=5,
+            timeout=10.0,
+            order=("searxng",),
+            gemini_model=None,
+            searxng_url="https://user:p%40ss@searx.example",
+            cache_ttl=0.0,
+            auth={},
+        )
+        self.assertNotIn("user", settings.secrets)
+        result = backends.SearchResult(
+            "searxng",
+            items=[backends.ResultItem("users", "https://example.com/users/alice")],
+        )
+        websearch._redact_result(result, settings.secrets)
+        self.assertEqual(len(result.items), 1)
+
+    async def test_every_provider_controlled_field_is_redacted(self) -> None:
+        self.assertEqual(websearch._redact("echo short", ("short",)), "echo ***")
+        self.assertEqual(websearch._redact("Linux X11", ("X",)), "Linux ***11")
+        self.assertEqual(websearch._redact("echo X", ("X",)), "echo ***")
+        self.assertEqual(websearch._redact("prefixshortsuffix", ("short",)), "prefix***suffix")
+        self.assertEqual(websearch._redact("ok\rOVERWRITE", ()), "ok\nOVERWRITE")
+        self.assertEqual(websearch._redact("ABCDEF", ("ABC", "ABCDEF")), "***")
+        secret = "sk-secret-provider-value-12345"
+
+        async def leaking(client: Any, query: Any, settings: Any) -> Any:
+            return backends.SearchResult(
+                backend="ddg",
+                detail=f"detail {secret}",
+                answer=f"answer {secret}",
+                items=[
+                    backends.ResultItem(
+                        f"title {secret}",
+                        "https://example.com/safe",
+                        f"snippet {secret}",
+                    ),
+                    backends.ResultItem(
+                        "credential URL",
+                        f"https://example.com/?token={secret}",
+                    ),
+                ],
+                queries=[f"query {secret}"],
+            )
+
+        self.fake_backends(ddg=leaking)
+        with mock.patch.object(config.Settings, "secrets", property(lambda self: (secret,))):
+            text = await websearch.run("q")
+        self.assertNotIn(secret, text)
+        self.assertGreaterEqual(text.count("***"), 4)
+        self.assertNotIn("token=", text)
+        self.assertIn("result(s) removed", text)
+
+    async def test_run_never_raises_for_wrong_argument_types(self) -> None:
+        cases = (
+            ((123,), {}),
+            (("q",), {"num_results": "5"}),
+            (("q",), {"domains": 5}),
+        )
+        for args, kwargs in cases:
+            with self.subTest(args=args, kwargs=kwargs):
+                text = await websearch.run(*args, **kwargs)  # type: ignore[arg-type]
+                self.assertTrue(text.startswith("websearch failed:"))
+
     async def test_query_is_truncated(self) -> None:
         seen: list[config.SearchQuery] = []
 
@@ -141,6 +256,8 @@ class OrchestrationTest(unittest.IsolatedAsyncioTestCase):
 class CacheTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         websearch.clear_cache()
+        self.addCleanup(websearch.clear_cache)
+        websearch.reset_health()
         patcher = mock.patch.object(config, "read_first_json", return_value={})
         self.addCleanup(patcher.stop)
         patcher.start()
@@ -207,14 +324,123 @@ class CacheTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("from cache", text)
 
+    async def test_gemini_model_is_part_of_the_cache_key(self) -> None:
+        calls: list[str | None] = []
+
+        async def gemini(client: Any, query: Any, settings: config.Settings) -> Any:
+            calls.append(settings.gemini_model)
+            return result("gemini", answer=settings.gemini_model)
+
+        backend_patch = mock.patch.dict(backends.BACKENDS, {"gemini": gemini}, clear=True)
+        available_patch = mock.patch.object(config.Settings, "available", lambda self, name: name == "gemini")
+        env_patch = mock.patch.dict(os.environ, {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "300"}, clear=True)
+        with backend_patch, available_patch, env_patch:
+            first = await websearch.search("q", model="model-a")
+            second = await websearch.search("q", model="model-b")
+            third = await websearch.search("q", model="model-b")
+
+        self.assertEqual(calls, ["model-a", "model-b"])
+        self.assertEqual([first[0].answer, second[0].answer, third[0].answer], ["model-a", "model-b", "model-b"])
+
+    async def test_searxng_endpoint_is_part_of_the_cache_configuration(self) -> None:
+        calls: list[str | None] = []
+
+        async def searxng(client: Any, query: Any, settings: config.Settings) -> Any:
+            calls.append(settings.searxng_url)
+            return result("searxng", answer=settings.searxng_url)
+
+        with mock.patch.dict(backends.BACKENDS, {"searxng": searxng}, clear=True), mock.patch.dict(
+            os.environ,
+            {
+                "PRIME_AGENT_WEBSEARCH_CACHE_TTL": "300",
+                "SEARXNG_URL": "https://one.example",
+            },
+            clear=True,
+        ):
+            first = await websearch.search("q", provider="searxng")
+            os.environ["SEARXNG_URL"] = "https://two.example"
+            second = await websearch.search("q", provider="searxng")
+        self.assertEqual(calls, ["https://one.example", "https://two.example"])
+        self.assertEqual(first[0].answer, "https://one.example")
+        self.assertEqual(second[0].answer, "https://two.example")
+
+    async def test_raw_results_cannot_mutate_cached_results(self) -> None:
+        calls = self.install("300")
+        first = await websearch.search("q")
+        first[0].items[0].title = "poisoned"
+        first[0].queries.append("poisoned")
+        first.clear()
+
+        second = await websearch.search("q")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second[0].items[0].title, "ddg title")
+        self.assertEqual(second[0].queries, [])
+
+        second[0].items.clear()
+        third = await websearch.search("q")
+        self.assertEqual(len(third[0].items), 1)
+
+    async def test_clear_during_search_prevents_late_repopulation(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[int] = []
+
+        async def blocked(client: Any, query: Any, settings: Any) -> Any:
+            calls.append(1)
+            started.set()
+            await release.wait()
+            return result("ddg")
+
+        with mock.patch.dict(backends.BACKENDS, {"ddg": blocked}, clear=True), mock.patch.object(
+            config.Settings, "available", lambda self, name: name == "ddg"
+        ), mock.patch.dict(os.environ, {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "300"}, clear=True):
+            pending = asyncio.create_task(websearch.run("q"))
+            await started.wait()
+            websearch.clear_cache()
+            release.set()
+            await pending
+            self.assertEqual(websearch._CACHE, {})
+            await websearch.run("q")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_replacing_an_existing_full_cache_entry_does_not_evict_another(self) -> None:
+        settings = config.load_settings()
+        for index in range(websearch._CACHE_MAX_ENTRIES):
+            outcome = websearch.Outcome(config.SearchQuery(f"q{index}"), settings, results=[result("ddg")])
+            websearch._cache_put((index,), outcome, 300.0)
+        keys_before = set(websearch._CACHE)
+
+        replacement = websearch.Outcome(config.SearchQuery("replacement"), settings, results=[result("ddg")])
+        websearch._cache_put((websearch._CACHE_MAX_ENTRIES - 1,), replacement, 300.0)
+        self.assertEqual(set(websearch._CACHE), keys_before)
+
+    def test_cache_does_not_retain_settings_credentials(self) -> None:
+        settings = replace(
+            config.load_settings(),
+            auth={"credential": {"key": "secret"}},
+            searxng_url="https://user:password@searx.example",
+        )
+        outcome = websearch.Outcome(config.SearchQuery("q"), settings, results=[result("ddg")])
+        websearch._cache_put(("q",), outcome, 300.0)
+        stored = websearch._CACHE[("q",)][1]
+        self.assertEqual(stored.settings.auth, {})
+        self.assertIsNone(stored.settings.searxng_url)
+        self.assertEqual(settings.auth, {"credential": {"key": "secret"}})
+
 
 class RenderingTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         websearch.clear_cache()
+        websearch.reset_health()
         patcher = mock.patch.object(config, "read_first_json", return_value={})
         self.addCleanup(patcher.stop)
         patcher.start()
-        env = mock.patch.dict(os.environ, {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "0"}, clear=True)
+        env = mock.patch.dict(
+            os.environ,
+            {"PRIME_AGENT_WEBSEARCH_CACHE_TTL": "0", "PRIME_AGENT_WEBSEARCH_COOLDOWN": "0"},
+            clear=True,
+        )
         self.addCleanup(env.stop)
         env.start()
 
@@ -241,7 +467,10 @@ class RenderingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1. Title", text)
         self.assertIn("   https://example.com", text)
         self.assertIn("q1; q2", text)
-        self.assertIn("2 result(s) removed by the domain filter", text)
+        self.assertIn(
+            "2 result(s) removed by URL safety, credential redaction, or the domain filter",
+            text,
+        )
         self.assertIn("used: gemini", text)
 
 

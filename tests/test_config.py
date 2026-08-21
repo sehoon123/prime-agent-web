@@ -115,6 +115,24 @@ class GeminiEndpointDiscoveryTest(unittest.TestCase):
         corp = next(e for e in self.endpoints(rotator) if e.label == "corp-gemini")
         self.assertEqual(corp.keys, ("sk-corp", "sk-pool-2", "sk-pool-3"))
 
+    def test_custom_google_auth_is_not_reused_for_public_studio(self) -> None:
+        models = {
+            "providers": {
+                "google": {
+                    "baseUrl": "https://corp.example/v1",
+                    "api": config.GOOGLE_API,
+                    "models": [{"id": "gemini-flash"}],
+                }
+            }
+        }
+        auth = {"google": {"type": "api_key", "key": "CORP-ONLY"}}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            endpoints = config.gemini_endpoints(
+                models_json=models, auth=auth, rotator=config.RotatorKeys()
+            )
+        self.assertEqual([endpoint.label for endpoint in endpoints], ["google"])
+        self.assertEqual(endpoints[0].base_url, "https://corp.example/v1")
+
     def test_ai_studio_endpoint_from_env(self) -> None:
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "sk-studio"}, clear=True):
             endpoints = config.gemini_endpoints(
@@ -173,6 +191,21 @@ class RotatorParsingTest(unittest.TestCase):
             with mock.patch.object(config, "read_first_json", return_value={}):
                 self.assertEqual(config.load_rotator_keys().by_provider, {})
 
+    def test_explicit_empty_rotator_does_not_fall_back(self) -> None:
+        fallback = {
+            "provider": "corp",
+            "keys": [{"value": "must-not-load"}],
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "empty.json"
+            path.write_text("{}")
+            with mock.patch.dict(
+                os.environ,
+                {"PRIME_AGENT_WEBSEARCH_KEY_ROTATOR": str(path)},
+                clear=True,
+            ), mock.patch.object(config, "read_first_json", return_value=fallback):
+                self.assertEqual(config.load_rotator_keys().by_provider, {})
+
 
 class OrderParsingTest(unittest.TestCase):
     def test_auto_and_all_use_full_order(self) -> None:
@@ -201,8 +234,10 @@ class OrderParsingTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(config.wants_every_backend("all"))
             self.assertTrue(config.wants_every_backend("gemini,ddg"))
+            self.assertTrue(config.wants_every_backend("gemini ddg"))
             self.assertFalse(config.wants_every_backend("auto"))
             self.assertFalse(config.wants_every_backend("ddg"))
+            self.assertFalse(config.wants_every_backend("ddg,"))
 
 
 class SettingsTest(unittest.TestCase):
@@ -212,7 +247,7 @@ class SettingsTest(unittest.TestCase):
                 self.assertEqual(config.load_settings(num_results=999).num_results, config.MAX_NUM_RESULTS)
                 self.assertEqual(config.load_settings(num_results=0).num_results, 1)
                 self.assertEqual(config.load_settings().num_results, config.DEFAULT_NUM_RESULTS)
-                self.assertEqual(config.load_settings(timeout=0.1).timeout, 1.0)
+                self.assertEqual(config.load_settings(timeout=0.1).timeout, 0.1)
 
     def test_env_defaults(self) -> None:
         env = {"PRIME_AGENT_WEBSEARCH_NUM_RESULTS": "7", "PRIME_AGENT_WEBSEARCH_TIMEOUT": "12.5"}
@@ -231,11 +266,72 @@ class SettingsTest(unittest.TestCase):
                 self.assertFalse(settings.available("gemini"))
                 self.assertFalse(settings.available("searxng"))
 
+    def test_default_roots_are_never_mixed(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            prime = home / ".prime" / "agent"
+            legacy = home / ".pi" / "agent"
+            prime.mkdir(parents=True)
+            legacy.mkdir(parents=True)
+            (prime / "models.json").write_text(
+                json.dumps(
+                    {
+                        "providers": {
+                            "corp": {
+                                "api": config.GOOGLE_API,
+                                "baseUrl": "https://corp.example/v1beta",
+                                "models": [{"id": "gemini-flash"}],
+                            }
+                        }
+                    }
+                )
+            )
+            (legacy / "auth.json").write_text(
+                json.dumps(
+                    {"corp": {"type": "api_key", "key": "legacy-secret"}}
+                )
+            )
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                self.assertEqual(config.agent_dirs(), (prime,))
+                self.assertEqual(config.gemini_endpoints(rotator=config.RotatorKeys()), ())
+
+    def test_legacy_root_is_used_only_when_prime_is_absent(self) -> None:
+        with TemporaryDirectory() as directory:
+            home = Path(directory)
+            prime = home / ".prime" / "agent"
+            legacy = home / ".pi" / "agent"
+            prime.mkdir(parents=True)
+            legacy.mkdir(parents=True)
+            (legacy / "auth.json").write_text("{}")
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.dict(
+                os.environ, {}, clear=True
+            ):
+                self.assertEqual(config.agent_dirs(), (legacy,))
+
+    def test_searxng_percent_encoded_userinfo_has_decoded_redaction_values(self) -> None:
+        settings = config.Settings(
+            num_results=5,
+            timeout=10.0,
+            order=("searxng",),
+            gemini_model=None,
+            searxng_url="https://user:p%40ss@searx.example",
+            cache_ttl=0.0,
+            auth={},
+        )
+        self.assertIn("p%40ss", settings.secrets)
+        self.assertIn("p@ss", settings.secrets)
+
+    def test_explicit_timeout_must_be_positive_and_finite(self) -> None:
+        for value in (0, -1, float("inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                config.load_settings(timeout=value)
+
     def test_agent_dirs_honour_overrides(self) -> None:
         with mock.patch.dict(os.environ, {"PRIME_AGENT_CODING_AGENT_DIR": "/tmp/custom-agent"}, clear=True):
             dirs = config.agent_dirs()
-        self.assertEqual(dirs[0], Path("/tmp/custom-agent"))
-        self.assertIn(Path.home() / ".prime" / "agent", dirs)
+        self.assertEqual(dirs, (Path("/tmp/custom-agent"),))
 
 
 if __name__ == "__main__":
@@ -352,13 +448,34 @@ class UrlSafetyTest(unittest.TestCase):
             "http://10.0.0.5/",
             "http://192.168.1.1/",
             "http://172.16.0.1/",
+            "http://100.64.0.1/",
+            "http://[64:ff9b::a9fe:a9fe]/",
             "http://[::1]/",
             "http://[fd00::1]/",
+            "http://[fec0::1]/",
             "http://printer.local/",
             "http://vault.internal/",
             "http://intranet/",                            # bare internal label
+            "https://safe.example/x\nFAKE",
+            "https://safe.example/x\x1b[31m",
+            "https://safe.example/x\u202eTXT",
+            "https://safe.example/x&#x202e;TXT",
+            "https://127&period;0.0&period;1/x",
+            "https://user&commat;evil.example/x",
+            "https://127%2e0.0%2e1/x",
+            "https://169%2e254.169%2e254/x",
+            "https://127.1/x",
+            "https://0177.0.0.1/x",
+            "https://0x7f.1/x",
+            "https://169.254.43518/x",
         ):
             self.assertFalse(config.is_public_http_url(url), url)
+
+    def test_endpoint_label_strips_basic_auth(self) -> None:
+        label = config.safe_endpoint_label("https://user:secret@example.com:8443/root")
+        self.assertEqual(label, "https://example.com:8443")
+        self.assertNotIn("user", label)
+        self.assertNotIn("secret", label)
 
     def test_non_http_schemes_and_credentials_are_blocked(self) -> None:
         for url in (

@@ -13,6 +13,7 @@ import httpx
 
 import webfetch
 from webfetch import _gemini
+from websearch import config as search_config
 
 
 def answer_payload(text: str, retrieved: Sequence[str] = ()) -> dict[str, Any]:
@@ -83,17 +84,133 @@ class VideoUrlDetectionTest(unittest.TestCase):
             "https://example.com/watch?v=abc",
             "https://vimeo.com/12345",
             "https://notyoutube.com/watch?v=a",
+            "https://youtube.com/watchlist",
         ):
             self.assertFalse(_gemini.is_video_url(url), url)
 
 
 class GenerateTest(unittest.IsolatedAsyncioTestCase):
+    def test_cache_fingerprint_changes_when_only_key_rotates(self) -> None:
+        endpoint_a = search_config.GeminiEndpoint(
+            "gateway", "https://gateway.example/v1", ("model",), ("KEY-A",), "test"
+        )
+        endpoint_b = search_config.GeminiEndpoint(
+            "gateway", "https://gateway.example/v1", ("model",), ("KEY-B",), "test"
+        )
+        with mock.patch.object(_gemini, "_endpoints", return_value=(endpoint_a,)):
+            first = _gemini.cache_fingerprint()
+        with mock.patch.object(_gemini, "_endpoints", return_value=(endpoint_b,)):
+            second = _gemini.cache_fingerprint()
+        self.assertNotEqual(first, second)
+        self.assertNotIn("KEY", first + second)
+
     async def test_unavailable_without_endpoints(self) -> None:
         patch_endpoints(self)
         async with client_for(lambda request: httpx.Response(200)) as client:
             with self.assertRaises(_gemini.GeminiUnavailable) as ctx:
                 await _gemini.generate(client, [{"text": "hi"}])
         self.assertIn("websearch", str(ctx.exception))
+
+    async def test_empty_ai_studio_model_list_uses_documented_fallback(self) -> None:
+        endpoint = search_config.GeminiEndpoint(
+            "google-ai-studio",
+            search_config.AI_STUDIO_BASE_URL,
+            (),
+            ("AIza-test-key-123456789",),
+        )
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(200, json=answer_payload("works"))
+
+        with mock.patch.object(
+            search_config, "gemini_endpoints", return_value=(endpoint,)
+        ):
+            async with client_for(handler) as client:
+                answer = await _gemini.generate(client, [{"text": "hi"}])
+        self.assertEqual(answer.text, "works")
+        self.assertTrue(any("/models/gemini-flash-latest:" in url for url in seen))
+
+    async def test_provider_echoes_are_redacted_and_unsafe_urls_are_dropped(self) -> None:
+        secret = "AIza-leaked-secret-123456789"
+        endpoint = FakeEndpoint(
+            "corp", "https://gw.example.com/v1beta", ("m",), (secret,)
+        )
+        patch_endpoints(self, endpoint)
+
+        def failure(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                json={"error": {"message": f"denied key {secret}"}},
+            )
+
+        async with client_for(failure) as client:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _gemini.generate(client, [{"text": "hi"}])
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertIn("***", str(ctx.exception))
+
+        payload = answer_payload(
+            f"answer {secret}",
+            [
+                f"https://example.com/?key={secret}",
+                "http://169.254.169.254/latest/meta-data/",
+            ],
+        )
+        async with client_for(lambda request: httpx.Response(200, json=payload)) as client:
+            answer = await _gemini.generate(client, [{"text": "hi"}])
+        self.assertNotIn(secret, answer.text)
+        self.assertEqual(answer.retrieved_urls, [])
+
+    async def test_short_and_prior_failover_keys_are_redacted(self) -> None:
+        first = "short"
+        second = "SECONDSECRET-123"
+        endpoint = FakeEndpoint(
+            "corp", "https://gw.example.com/v1beta", ("m",), (first, second)
+        )
+        patch_endpoints(self, endpoint)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.headers["x-goog-api-key"] == first:
+                return httpx.Response(
+                    429, json={"error": {"message": f"echo {first}"}}
+                )
+            return httpx.Response(200, json=answer_payload(f"repeats {first}"))
+
+        async with client_for(handler) as client:
+            answer = await _gemini.generate(client, [{"text": "hi"}])
+        self.assertEqual(answer.text, "repeats ***")
+
+        only_short = FakeEndpoint(
+            "corp", "https://gw.example.com/v1beta", ("m",), (first,)
+        )
+        patch_endpoints(self, only_short)
+        async with client_for(
+            lambda request: httpx.Response(
+                400, json={"error": {"message": f"echo {first}"}}
+            )
+        ) as client:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _gemini.generate(client, [{"text": "hi"}])
+        self.assertNotIn(first, str(ctx.exception))
+        self.assertIn("***", str(ctx.exception))
+
+    async def test_oversized_provider_response_is_rejected(self) -> None:
+        patch_endpoints(self, CORP)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"x" * (5 * 1024 * 1024 + 1)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers["accept-encoding"], "identity")
+            return httpx.Response(200, stream=Stream())
+
+        async with client_for(handler) as client:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _gemini.generate(client, [{"text": "hi"}])
+        self.assertIn("provider response exceeded", str(ctx.exception))
 
     async def test_url_context_request_shape_and_parse(self) -> None:
         patch_endpoints(self, CORP)
@@ -250,6 +367,26 @@ class TierRoutingTest(unittest.IsolatedAsyncioTestCase):
         # The page itself was never fetched locally.
         self.assertTrue(all("generateContent" in path for path in paths))
 
+    async def test_requested_model_without_endpoint_is_an_error(self) -> None:
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, text="local page")
+
+        with mock.patch.object(_gemini, "available", return_value=False):
+            document = await webfetch.fetch(
+                "https://example.com/p",
+                prompt="Q?",
+                respect_robots=False,
+                transport=httpx.MockTransport(handler),
+                resolver=public_resolver,
+            )
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(document.kind, "error")
+        self.assertIn("no Gemini endpoint is available", document.error or "")
+        self.assertEqual(calls, [])
+
     async def test_no_prompt_stays_local(self) -> None:
         patch_endpoints(self, CORP)
 
@@ -317,12 +454,39 @@ class TierRoutingTest(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             raise AssertionError("no request may be made for a refused target")
 
+        for options in ({}, {"prompt": "read it"}, {"gemini": True}):
+            with self.subTest(options=options):
+                document = await webfetch.fetch(
+                    "http://169.254.169.254/latest/meta-data/",
+                    respect_robots=False,
+                    transport=httpx.MockTransport(handler),
+                    **options,
+                )
+                assert isinstance(document, webfetch.Document)
+                self.assertEqual(document.kind, "error")
+                self.assertIn("non-public", document.error or "")
+
+    async def test_robots_policy_precedes_prompted_url_context(self) -> None:
+        patch_endpoints(self, CORP)
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if "generateContent" in str(request.url):
+                raise AssertionError("robots refusal must precede Gemini retrieval")
+            return httpx.Response(200, text="User-agent: *\nDisallow: /\n")
+
         document = await webfetch.fetch(
-            "http://169.254.169.254/latest/meta-data/", transport=httpx.MockTransport(handler)
+            "https://example.com/private",
+            prompt="read it",
+            respect_robots=True,
+            resolver=public_resolver,
+            transport=httpx.MockTransport(handler),
         )
         assert isinstance(document, webfetch.Document)
         self.assertEqual(document.kind, "error")
-        self.assertIn("non-public", document.error or "")
+        self.assertIn("robots.txt", document.error or "")
+        self.assertEqual(requested, ["https://example.com/robots.txt"])
 
     async def test_scanned_pdf_escalates_to_vision(self) -> None:
         patch_endpoints(self, CORP)
@@ -343,6 +507,37 @@ class TierRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.bytes_len, len(pdf))
         self.assertIn("transcribed", document.text)
 
+    async def test_scanned_pdf_honors_max_pages_before_gemini(self) -> None:
+        patch_endpoints(self, CORP)
+        pdf = make_pdf(2)
+        pages_sent: list[int] = []
+
+        async def read_limited(
+            client: httpx.AsyncClient,
+            content: bytes,
+            prompt: str | None = None,
+            **kwargs: Any,
+        ) -> _gemini.GeminiAnswer:
+            from pypdf import PdfReader
+
+            pages_sent.append(len(PdfReader(BytesIO(content)).pages))
+            return _gemini.GeminiAnswer("limited", "fake")
+
+        with mock.patch.object(_gemini, "read_pdf", new=read_limited):
+            document = await webfetch.fetch(
+                "https://example.com/scan.pdf",
+                max_pages=1,
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200, content=pdf, headers={"content-type": "application/pdf"}
+                    )
+                ),
+                resolver=public_resolver,
+            )
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(pages_sent, [1])
+        self.assertEqual(document.text, "limited")
+
     async def test_scanned_pdf_without_gemini_keeps_the_note(self) -> None:
         patch_endpoints(self)  # nothing configured
         pdf = make_pdf(1)
@@ -358,14 +553,19 @@ class TierRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.kind, "pdf")
         self.assertTrue(any("scanned" in note for note in document.notes))
 
-    async def test_url_context_failure_falls_back_to_local_fetch(self) -> None:
+    async def test_url_context_failure_does_not_cache_an_ignored_prompt(self) -> None:
         patch_endpoints(self, CORP)
+        calls: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
             if "generateContent" in str(request.url):
                 return httpx.Response(500, json={"error": {"message": "model down"}})
-            return httpx.Response(200, text="<html><body><main><p>local text</p></main></body></html>",
-                                  headers={"content-type": "text/html"})
+            return httpx.Response(
+                200,
+                text="<html><body><main><p>local text</p></main></body></html>",
+                headers={"content-type": "text/html"},
+            )
 
         document = await webfetch.fetch(
             "https://example.com/p",
@@ -374,9 +574,9 @@ class TierRoutingTest(unittest.IsolatedAsyncioTestCase):
             resolver=public_resolver,
         )
         assert isinstance(document, webfetch.Document)
-        self.assertEqual(document.source, "local")
-        self.assertIn("local text", document.text)
-        self.assertTrue(any("url_context unavailable" in note for note in document.notes))
+        self.assertEqual(document.kind, "error")
+        self.assertIn("gemini-url-context failed", document.error or "")
+        self.assertFalse(any(url == "https://example.com/p" for url in calls))
 
 
 class GeminiRenderTest(unittest.IsolatedAsyncioTestCase):

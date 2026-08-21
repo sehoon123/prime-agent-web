@@ -9,10 +9,13 @@ reference pages it dropped every heading and link.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
-from tempfile import gettempdir
+from tempfile import gettempdir, mkstemp
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -155,9 +158,6 @@ def html_to_markdown(html: str, *, strip_boilerplate: bool = True) -> Extracted:
     if strip_boilerplate:
         for element in soup(list(BOILERPLATE_TAGS)):
             element.decompose()
-        for comment_parent in soup.find_all(string=lambda value: isinstance(value, str) and False):
-            comment_parent.extract()  # pragma: no cover - placeholder for clarity
-
         root = None
         for selector in CONTENT_SELECTORS:
             try:
@@ -177,7 +177,10 @@ def html_to_markdown(html: str, *, strip_boilerplate: bool = True) -> Extracted:
 
 
 def html_to_text(html: str) -> Extracted:
-    from bs4 import BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as error:  # pragma: no cover - declared dependency
+        raise RuntimeError("beautifulsoup4 is required to extract HTML") from error
 
     soup = BeautifulSoup(html, "html.parser")
     title = html_title(soup)
@@ -192,16 +195,15 @@ def pdf_to_text(content: bytes, *, max_pages: Optional[int] = None) -> Extracted
         from pypdf import PdfReader
     except ImportError as error:  # pragma: no cover - declared dependency
         raise RuntimeError("pypdf is required to extract PDFs") from error
-    from io import BytesIO
-
     try:
         # strict=False keeps slightly malformed PDFs readable, as most real ones are.
         reader = PdfReader(BytesIO(content), strict=False)
+        # pypdf may build the page tree lazily, so include this in the parse guard.
+        total = len(reader.pages)
     except Exception as error:
         raise RuntimeError(f"could not parse PDF: {type(error).__name__}") from error
 
     notes: list[str] = []
-    total = len(reader.pages)
     limit = total if max_pages is None else min(total, max_pages)
     if limit < total:
         notes.append(f"first {limit} of {total} pages")
@@ -228,6 +230,26 @@ def pdf_to_text(content: bytes, *, max_pages: Optional[int] = None) -> Extracted
     return Extracted(kind="pdf", text=body, title=title, pages=total, notes=notes)
 
 
+def limit_pdf_pages(content: bytes, max_pages: Optional[int]) -> bytes:
+    """Return a valid PDF containing only the requested leading pages."""
+    if max_pages is None:
+        return content
+    try:
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(BytesIO(content), strict=False)
+        if len(reader.pages) <= max_pages:
+            return content
+        writer = PdfWriter()
+        for page in reader.pages[:max_pages]:
+            writer.add_page(page)
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    except Exception as error:
+        raise RuntimeError(f"could not limit PDF pages: {type(error).__name__}") from error
+
+
 def save_binary(content: bytes, url: str, content_type: str) -> Extracted:
     """Write a non-text body to a temp file and report where it landed."""
     suffix = {
@@ -245,8 +267,70 @@ def save_binary(content: bytes, url: str, content_type: str) -> Extracted:
         suffix = tail if 1 < len(tail) <= 6 else ".bin"
 
     digest = hashlib.sha256(content).hexdigest()[:16]
-    path = Path(gettempdir()) / f"webfetch-{digest}{suffix}"
-    path.write_bytes(content)
+    desired = Path(gettempdir()) / f"webfetch-{digest}{suffix}"
+    raw_path: Optional[str] = None
+    descriptor: Optional[int] = None
+    try:
+        descriptor, raw_path = mkstemp(prefix=f".webfetch-{digest}-", suffix=suffix)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None  # fdopen owns it now
+        with handle:
+            handle.write(content)
+        temporary = Path(raw_path)
+
+        try:
+            os.link(temporary, desired, follow_symlinks=False)
+        except FileExistsError:
+            # Reuse only a private, regular, same-user file with identical bytes.
+            safe = False
+            existing_fd: Optional[int] = None
+            try:
+                no_follow = getattr(os, "O_NOFOLLOW", None)
+                get_uid = getattr(os, "geteuid", None)
+                if no_follow is None or get_uid is None:
+                    raise OSError("safe deterministic reuse is unavailable")
+                flags = os.O_RDONLY | no_follow | getattr(os, "O_NONBLOCK", 0)
+                existing_fd = os.open(desired, flags)
+                info = os.fstat(existing_fd)
+                safe = (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_uid == get_uid()
+                    and info.st_mode & 0o077 == 0
+                    and info.st_size == len(content)
+                )
+                digest_check = hashlib.sha256()
+                while safe:
+                    chunk = os.read(existing_fd, 65536)
+                    if not chunk:
+                        break
+                    digest_check.update(chunk)
+                safe = safe and digest_check.digest() == hashlib.sha256(content).digest()
+            except OSError:
+                safe = False
+            finally:
+                if existing_fd is not None:
+                    os.close(existing_fd)
+            if safe:
+                temporary.unlink()
+                path = desired
+            else:
+                path = temporary
+        except (OSError, NotImplementedError):
+            # Some platforms cannot publish hard links with no-follow semantics;
+            # the already-private random file remains safe to return.
+            path = temporary
+        else:
+            temporary.unlink()
+            path = desired
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if raw_path is not None:
+            try:
+                Path(raw_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise RuntimeError(f"could not save binary body: {type(error).__name__}") from error
     note = f"binary body ({content_type or 'unknown type'}, {len(content):,} bytes) saved to {path}"
     if content_type.startswith("image/"):
         note += "; use the attach-image skill or PIL to inspect it"

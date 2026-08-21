@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 from unittest import mock
 
 import httpx
@@ -19,7 +19,7 @@ from webfetch._files import FilesApiUnsupported, upload_base
 
 from .test_webfetch_gemini import CORP, FakeEndpoint, answer_payload, client_for, patch_endpoints
 
-UPLOAD_SESSION = "https://upload.example.com/session/abc"
+UPLOAD_SESSION = "https://gw.example.com/session/abc"
 
 
 class UploadBaseTest(unittest.TestCase):
@@ -67,10 +67,11 @@ def resumable_handler(
         if url.endswith("/upload/v1beta/files") and request.method == "POST":
             if start_status != 200:
                 return httpx.Response(start_status, text="no")
-            headers = {"x-goog-upload-url": UPLOAD_SESSION} if give_session else {}
+            session_url = str(request.url.copy_with(path="/session/abc", query=None))
+            headers = {"x-goog-upload-url": session_url} if give_session else {}
             return httpx.Response(200, json={}, headers=headers)
 
-        if url == UPLOAD_SESSION:
+        if request.url.path == "/session/abc":
             return httpx.Response(
                 200, json={"file": {"uri": "https://files.example.com/f/1", "name": "files/1", "state": state}}
             )
@@ -144,8 +145,11 @@ class UploadProtocolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uploaded.name, "files/1")
         self.assertEqual(sum(1 for entry in seen if entry.startswith("GET")), 2)
 
-    async def test_failed_processing_raises(self) -> None:
-        handler = resumable_handler(state="PROCESSING", poll_states=["FAILED"])
+    async def test_failed_processing_raises_and_deletes(self) -> None:
+        seen: list[str] = []
+        handler = resumable_handler(
+            state="PROCESSING", poll_states=["FAILED"], seen=seen
+        )
         with mock.patch.object(_files, "POLL_INITIAL_DELAY", 0.0):
             async with client_for(handler) as client:
                 with self.assertRaises(RuntimeError) as ctx:
@@ -153,6 +157,65 @@ class UploadProtocolTest(unittest.IsolatedAsyncioTestCase):
                         client, "https://gw.example.com/v1beta", "k", b"payload", "application/pdf"
                     )
         self.assertIn("failed to process", str(ctx.exception))
+        self.assertTrue(any(entry.startswith("DELETE") for entry in seen))
+
+    async def test_finalize_never_forwards_key_or_crosses_origin(self) -> None:
+        finalize_headers: dict[str, str] = {}
+
+        def safe_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/files"):
+                return httpx.Response(
+                    200,
+                    headers={"x-goog-upload-url": UPLOAD_SESSION},
+                )
+            finalize_headers.update(dict(request.headers))
+            return httpx.Response(
+                200,
+                json={"file": {"uri": "u", "name": "files/1", "state": "ACTIVE"}},
+            )
+
+        async with client_for(safe_handler) as client:
+            await _files.upload(
+                client,
+                "https://gw.example.com/v1beta",
+                "TOPSECRET-123456789",
+                b"payload",
+                "application/pdf",
+            )
+        self.assertNotIn("x-goog-api-key", finalize_headers)
+        self.assertEqual(
+            _files._validated_session_url(
+                "https://gw.example.com/v1beta", "https://gw.example.com:443/session"
+            ),
+            "https://gw.example.com:443/session",
+        )
+        with self.assertRaises(RuntimeError):
+            _files._validated_session_url(
+                "https://gw.example.com/v1beta", "https://user:pass@gw.example.com/session"
+            )
+
+        requested: list[str] = []
+
+        def hostile_handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            return httpx.Response(
+                200,
+                headers={
+                    "x-goog-upload-url": "http://169.254.169.254/private-upload"
+                },
+            )
+
+        async with client_for(hostile_handler) as client:
+            with self.assertRaises(RuntimeError) as ctx:
+                await _files.upload(
+                    client,
+                    "https://gw.example.com/v1beta",
+                    "TOPSECRET-123456789",
+                    b"payload",
+                    "application/pdf",
+                )
+        self.assertIn("cross-origin", str(ctx.exception))
+        self.assertEqual(requested, ["https://gw.example.com/upload/v1beta/files"])
 
     async def test_gateway_404_is_unsupported_not_a_failure(self) -> None:
         async with client_for(resumable_handler(start_status=404)) as client:
@@ -247,6 +310,10 @@ class GenerateWithUploadTest(unittest.IsolatedAsyncioTestCase):
 
 
 class OversizedPdfRoutingTest(unittest.IsolatedAsyncioTestCase):
+    def test_inline_raw_limit_accounts_for_base64_expansion(self) -> None:
+        encoded_size = 4 * ((_gemini.MAX_INLINE_BYTES + 2) // 3)
+        self.assertLess(encoded_size, 20 * 1024 * 1024)
+
     def oversized(self) -> bytes:
         return b"%PDF-" + b"x" * _gemini.MAX_INLINE_BYTES
 

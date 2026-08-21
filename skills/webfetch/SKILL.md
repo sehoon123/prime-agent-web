@@ -28,12 +28,21 @@ for doc in docs:
     print(doc.final_url, doc.ok, doc.error or len(doc.text))
 ```
 
+Successful fetches live in a small session cache, so later retries and
+reformulations can reuse the extracted Document. Hits come back with a
+`from session cache` note, errors are never cached, and `webfetch.clear_cache()`
+drops completed entries. Concurrent duplicate calls remain independent.
+
+```python
+webfetch.clear_cache()   # force the next fetch to hit the network again
+```
+
 ## Arguments
 
 ```python
 await webfetch(url)                          # markdown (default)
 await webfetch(url, mode="text")             # plain text
-await webfetch(url, mode="raw")              # body exactly as served (JSON, YAML, source)
+await webfetch(url, mode="raw")              # decoded text without extraction; binaries go to a secure file
 await webfetch(url, max_chars=0)             # do not truncate the rendered output
 await webfetch(url, max_pages=5)             # PDFs: first 5 pages only
 await webfetch(url, max_bytes=40_000_000)    # allow a large PDF (default 10 MB)
@@ -55,8 +64,9 @@ await webfetch(url, gemini=True)                 # force the model path
 ```
 
 A prompt routes through Gemini's `url_context` tool, which fetches server-side and
-therefore also reads pages that need JavaScript or block scripted clients. If that
-call fails, the local fetch runs instead and the reason is reported as a note.
+therefore also reads pages that need JavaScript or block scripted clients. An explicit
+prompt or `gemini=True` returns a clear error if that model call fails; it never returns
+or caches a local page dump that did not satisfy the request.
 
 The model is used only where local extraction cannot work:
 
@@ -90,16 +100,25 @@ Fetching URLs that came from search results or page content is an SSRF risk, so
 every request is guarded:
 
 - only `http(s)`; no credentials in the URL; `file:`, `data:`, `ftp:` refused
-- `localhost`, `*.local`, `*.internal`, cloud metadata names and literal private,
-  loopback, link-local, multicast or reserved addresses are refused
-- **DNS preflight**: a hostname whose records point into private space is refused
+- `localhost`, `*.local`, `*.internal`, cloud metadata names and every non-global
+  address (including CGNAT and IPv6 site-local ranges) are refused
+- DNS records are checked and native connections are pinned to vetted addresses,
+  closing the DNS-rebinding gap while retaining address failover and the logical URL's
+  proxy routing; redirect cookies stay on their exact logical origin and are never
+  reused merely because hosts share an IP
 - redirects are followed manually, at most 5 hops, and **every hop is re-validated**
   before it is requested
-- `content-length` over the cap is refused before the body is downloaded; unannounced
-  bodies are cut off by a streaming guard
+- identity `content-length` over the cap is refused before download; compressed bodies
+  are judged by bounded decoded size (including concatenated gzip members), unannounced
+  bodies are cut off while streaming, partial binaries are errors, and Gemini/Files
+  responses have their own cap
 - `robots.txt` is honoured by default for autonomous fetches, following the
   convention of the official MCP fetch server, with `401`/`403` on robots.txt read
-  as a refusal. Pass `respect_robots=False` when a human asked for the page.
+  as a refusal. Parsing is limited to a 1 MiB prefix; matching has a bounded work
+  budget and denies conservatively if that budget is exhausted. Pass
+  `respect_robots=False` when a human asked for the page. For
+  Gemini's opaque server-side URL retrieval, this check covers the submitted URL;
+  provider-internal redirects cannot be inspected locally.
 
 ## Environment overrides
 
@@ -107,6 +126,7 @@ every request is guarded:
 - `PRIME_AGENT_WEBFETCH_MAX_BYTES` - body size cap (default 10485760)
 - `PRIME_AGENT_WEBFETCH_TIMEOUT` - HTTP timeout in seconds (default 45)
 - `PRIME_AGENT_WEBFETCH_RESPECT_ROBOTS` - `0` to skip robots.txt checks
+- `PRIME_AGENT_WEBFETCH_CACHE_TTL` - session document-cache TTL in seconds, `0` disables (default 300)
 
 Gemini endpoints and keys come from the `websearch` skill's discovery
 (`models.json`, `auth.json`, optional `key-rotator.json`, `GEMINI_API_KEY`), so
@@ -114,12 +134,15 @@ there is nothing extra to configure here. Pin the model with `model=` if needed.
 
 ## Notes
 
-- Errors never raise: `run()` returns a message and `fetch()` returns a Document
-  with `kind="error"` and `error` set.
+- `run()` returns a message for every error. `fetch()` turns each retrieval or
+  extraction failure into a Document with `kind="error"`; invalid call-level
+  arguments still raise `ValueError`.
+- Documents backed by a mutable temporary file (`saved_path`) are not cached;
+  refetching avoids returning a path the caller may have deleted or overwritten.
 - A large PDF fails with the exact `max_bytes=` value to retry with, instead of a
   library parse error.
-- A scanned PDF over the ~18 MB inline request limit is uploaded through the Gemini
-  Files API and deleted afterwards. Endpoints that proxy only `generateContent`
+- A scanned PDF over the ~14 MB raw inline limit is uploaded through the Gemini
+  Files API so base64 stays below the ~20 MB request cap, and is deleted afterwards. Endpoints that proxy only `generateContent`
   (common for corporate gateways) answer `404` there; that is detected and the error
   suggests `max_pages` or local extraction instead.
 - For a whole repository, clone it (`git clone`) rather than fetching pages.

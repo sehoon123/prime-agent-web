@@ -12,6 +12,8 @@ import asyncio
 import inspect
 import json
 import re
+import shutil
+import subprocess
 import sys
 import types
 import unittest
@@ -86,6 +88,24 @@ class DetectionContractTest(unittest.TestCase):
         self.assertTrue(skills)
         for entry in skills:
             self.assertTrue((REPO_ROOT / entry).is_dir(), f"{entry} does not exist")
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is required to inspect its tarball")
+    def test_npm_tarball_contains_only_source_and_required_docs(self) -> None:
+        completed = subprocess.run(
+            ["npm", "pack", "--dry-run", "--json", "--ignore-scripts"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        report = json.loads(completed.stdout)[0]
+        paths = {entry["path"] for entry in report["files"]}
+        self.assertIn("SECURITY.md", paths)
+        self.assertIn("CHANGELOG.md", paths)
+        forbidden = ("__pycache__", ".pyc", ".pyo", ".egg-info", "/build/", "/dist/")
+        self.assertFalse(
+            [path for path in paths if any(marker in path for marker in forbidden)]
+        )
 
 
 class RunSignatureTest(unittest.TestCase):
@@ -248,6 +268,26 @@ class BothSkillsContractTest(unittest.TestCase):
                 self.assertEqual(name.group(1).strip(), skill.name)
                 self.assertLessEqual(len(description.group(1).strip()), 500)
 
+    def test_versions_and_user_agents_match_the_package_metadata(self) -> None:
+        import importlib
+
+        changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        root_version = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))["version"]
+        skill_versions: set[str] = set()
+        for skill in self.skills():
+            import_name = skill.name.replace("-", "_")
+            module = importlib.import_module(import_name)
+            project = tomllib.loads((skill / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+            version = project["version"]
+            skill_versions.add(version)
+            with self.subTest(skill=skill.name):
+                self.assertEqual(module.__version__, version)
+                self.assertIn(f"## [{version}]", changelog)
+                for attribute in ("_USER_AGENT", "USER_AGENT_AUTONOMOUS", "USER_AGENT_MANUAL"):
+                    value = getattr(module, attribute, None)
+                    if value is not None:
+                        self.assertIn(f"/{version}", value)
+        self.assertEqual(skill_versions, {root_version})
     def test_each_skill_exposes_an_async_run(self) -> None:
         import importlib
 

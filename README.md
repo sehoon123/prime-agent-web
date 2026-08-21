@@ -62,6 +62,15 @@ and called from Python — per the
   kernel.
 - **Model-readable output.** Markdown with `[n]` citation markers, ending with which
   backends were used, unconfigured, or failed.
+- **Learns from this session's trajectory.** A backend that keeps failing sits out a
+  doubling cooldown (`PRIME_AGENT_WEBSEARCH_COOLDOWN`, `0` disables); one success
+  restores it. `await websearch.health()` shows the evidence behind the current
+  ordering — Continual-Harness thinking applied at skill scale.
+- **The session is the cache.** Successful fetches are reused inside the kernel
+  session (TTL 300s, `PRIME_AGENT_WEBFETCH_CACHE_TTL`), so later retries can reuse
+  the extracted Document — context as a variable, quota as a budget. Endpoint,
+  model and credential rotations form cache boundaries. Concurrent duplicate calls
+  remain independent.
 - **Secrets stay out of output.** Credentials are redacted from returned text and
   error messages, including keys a provider echoes back in its own error body.
 
@@ -92,6 +101,7 @@ print(await websearch.backends())
 auto order: gemini, tavily, brave, serper, exa, searxng, ddg
 recency values: day, week, month, year
 cache: 300s in-process
+cooldown: 120s base, doubling per consecutive failure
 ```
 
 Local checkout instead: `prime-agent package install /path/to/prime-agent-web`.
@@ -119,7 +129,7 @@ await websearch("cve-2026-1234", recency="week")                 # day|week|mont
 await websearch("rust async", domains="github.com,-reddit.com")  # "-" excludes
 await websearch("who won euro 2024", provider="ddg")             # force one backend
 await websearch("rust async runtimes", provider="all")           # all backends, concurrently
-await websearch("kernel panic", provider="gemini,ddg")           # explicit chain
+await websearch("kernel panic", provider="gemini,ddg")           # explicit concurrent fan-out
 help(websearch)
 ```
 
@@ -160,9 +170,10 @@ produces results.
 ### Filters
 
 `recency` and `domains` are translated to each backend's native parameter where one
-exists, expressed as query operators where it does not, and **always re-checked
-client-side** so a backend that silently ignores a filter cannot leak
-out-of-scope results. Removed results are reported as a count.
+exists and expressed as query operators where it does not. Result URLs are always
+re-checked client-side. A provider answer is discarded when no in-scope supporting
+URL survives; mixed provider prose cannot be attributed clause by clause. Removed
+results are reported as a count.
 
 | Backend | Recency | Domains |
 |---|---|---|
@@ -201,7 +212,7 @@ docs = await webfetch.fetch([url_a, url_b])                 # concurrent
 |---|---|
 | HTML | markdown with headings, code blocks and link targets kept; `script`/`nav`/`header`/`footer`/`aside` dropped; content taken from `<main>`/`<article>` when present |
 | PDF | per-page text with `--- page N ---` markers, page count, metadata title; scanned PDFs reported as having no text layer |
-| JSON / YAML / text | returned as served (`mode="raw"` for exact bytes) |
+| JSON / YAML / text | decoded text (`mode="raw"` skips tidying) |
 | images, archives | saved to a temp file, path reported |
 | `github.com/o/r/blob/…` | rewritten to `raw.githubusercontent.com` |
 | `github.com/o/r` | hint that `git clone` beats scraping HTML |
@@ -229,14 +240,14 @@ await webfetch(url, gemini=False)                # stay local, always
 | `prompt=`, or `gemini=True` | `gemini-url-context` | server-side fetch also reads JS-only and bot-blocked pages |
 | local fetch blocked or failed | `gemini-url-context` | recovers content instead of returning an error |
 | PDF with no text layer | `gemini-pdf` | a scan has nothing for pypdf to read |
-| scan over ~18 MB | `gemini-pdf` via Files API | too large to inline in a request |
+| scan over ~14 MB raw | `gemini-pdf` via Files API | base64 would exceed the ~20 MB request limit |
 | anything else | local | no model call, no token cost |
 
 `doc.source` reports which tier answered; `doc.answer` holds the model text;
 `webfetch.gemini_available()` says whether the tiers are usable. A URL refused by the
 safety checks is never handed to the model either.
 
-Documents over the ~18 MB inline request limit are uploaded with the Gemini
+Documents over the ~14 MB raw inline limit are uploaded with the Gemini
 [Files API](https://ai.google.dev/gemini-api/docs/files) (resumable protocol, state
 polled until `ACTIVE`, file deleted afterwards). Google AI Studio exposes it; many
 corporate gateways proxy only `generateContent` and answer `404`, which is detected
@@ -251,18 +262,20 @@ is tuned for news articles and destroys developer documentation.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PRIME_AGENT_WEBSEARCH_PROVIDER` | `auto` | default backend, `all`, or a comma-separated chain |
+| `PRIME_AGENT_WEBSEARCH_PROVIDER` | `auto` | default backend; `all` or a comma/space list runs a concurrent fan-out |
 | `PRIME_AGENT_WEBSEARCH_NUM_RESULTS` | `5` | default result count |
 | `PRIME_AGENT_WEBSEARCH_TIMEOUT` | `45` | HTTP timeout in seconds |
 | `PRIME_AGENT_WEBSEARCH_CACHE_TTL` | `300` | in-process cache TTL; `0` disables |
+| `PRIME_AGENT_WEBSEARCH_COOLDOWN` | `120` | failure cooldown base in seconds; `0` disables |
 | `PRIME_AGENT_WEBSEARCH_GEMINI_MODEL` | first `flash` model of the endpoint | pin the grounding model |
 | `PRIME_AGENT_WEBSEARCH_KEY_ROTATOR` | `<agent dir>/key-rotator.json` | path to a key-rotator config |
-| `SEARXNG_URL` | unset | SearXNG instance base URL |
-| `PRIME_AGENT_CODING_AGENT_DIR` | `~/.prime/agent` | config directory to read (`~/.pi/agent` is a fallback) |
+| `SEARXNG_URL` / `PRIME_AGENT_WEBSEARCH_SEARXNG_URL` | unset | SearXNG instance base URL |
+| `PRIME_AGENT_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR` | `~/.prime/agent` | authoritative config directory override; without one, `~/.pi/agent` is a fallback |
 | `PRIME_AGENT_WEBFETCH_MAX_CHARS` | `20000` | webfetch rendered output cap; `0` disables |
 | `PRIME_AGENT_WEBFETCH_MAX_BYTES` | `10485760` | webfetch body size cap |
 | `PRIME_AGENT_WEBFETCH_TIMEOUT` | `45` | webfetch HTTP timeout in seconds |
 | `PRIME_AGENT_WEBFETCH_RESPECT_ROBOTS` | `1` | `0` skips robots.txt checks |
+| `PRIME_AGENT_WEBFETCH_CACHE_TTL` | `300` | session document-cache TTL; `0` disables |
 
 Credential values follow Prime Agent's own rules: an environment variable name
 resolves to that variable, otherwise the value is used literally. `!command`
@@ -276,16 +289,21 @@ See [SECURITY.md](SECURITY.md). Summary:
 - Grounding redirect links are resolved by reading `Location` with redirect
   following **disabled**, so the target host is never contacted, and every hop is
   validated — loopback, private, link-local, multicast, reserved, metadata
-  hostnames, non-`http(s)` schemes, and URLs carrying credentials are refused.
-- Credentials are redacted from every returned string; `backends()` shows only the
-  credential's source, never its value.
+  hostnames, non-`http(s)` schemes, encoded/alternate numeric authorities, Unicode
+  controls, and URLs carrying credentials are refused. Candidate count, concurrency
+  and aggregate redirect time are bounded; unresolved redirectors are dropped.
+- Credentials are redacted from every returned string; source URLs containing a
+  known bearer key or password are removed, and `backends()` shows only the
+  credential's source.
 - Search results are untrusted third-party text; treat snippets as data, not
   instructions.
-- `webfetch` guards every request: http(s) only, no credentials in URLs, private and
-  metadata targets refused, **DNS preflight** so a hostname resolving into private
-  space is caught, manual redirect following with re-validation of every hop, size
-  caps enforced from `content-length` and again while streaming, and `robots.txt`
-  honoured by default for autonomous fetches.
+- `webfetch` guards every request: http(s) only, no credentials or control bytes in
+  URLs, non-global and metadata targets refused, DNS answers checked, and native
+  connections pinned to vetted addresses with logical proxy routing and exact-origin
+  redirect cookies. Redirects are followed manually and re-validated at every hop.
+  Transfer decoding (including concatenated gzip), page bodies and Gemini/Files
+  responses are bounded. `robots.txt` is honoured by default for autonomous fetches;
+  its bounded parser and matcher run off the event loop.
 
 ## Compatibility
 
@@ -293,7 +311,8 @@ See [SECURITY.md](SECURITY.md). Summary:
 - Python 3.10+. Runtime dependencies `httpx` and `beautifulsoup4` ship in the Prime
   Agent kernel venv; DuckDuckGo parsing falls back to a regex parser when
   BeautifulSoup is unavailable, so the skill also works in a bare environment.
-- No OS-specific code: paths go through `pathlib`, and no shell command is run.
+- No shell command is run. Paths use `pathlib`; secure temporary-file reuse falls
+  back to a private random file where no-follow/hard-link primitives are unavailable.
 
 ## Development
 
@@ -303,7 +322,7 @@ cd prime-agent-web
 PYTHONPATH=skills/websearch/src:skills/webfetch/src python3 -m unittest discover -s tests -t .
 ```
 
-201 offline tests, no network and no credentials required (`httpx.MockTransport`),
+The offline test suite needs no network or credentials (`httpx.MockTransport`),
 covering backend discovery (`models.json`, `key-rotator.json`, credential
 precedence and source reporting), every backend's request shape and response
 parsing, filter mapping per backend, Gemini key/endpoint failover and legacy-tool

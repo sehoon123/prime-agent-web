@@ -14,10 +14,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from urllib.parse import urlsplit, urlunsplit
+from . import _provider
 
 # Google deletes uploaded files after 48h; this skill also deletes them after use.
 POLL_ATTEMPTS = 12
@@ -53,6 +54,36 @@ def upload_base(base_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def _validated_session_url(base_url: str, session_url: str) -> str:
+    """Accept only credential-free upload URLs on the configured origin."""
+    try:
+        base = urlsplit(base_url)
+        session = urlsplit(session_url)
+        base_scheme = base.scheme.lower()
+        session_scheme = session.scheme.lower()
+        base_port = base.port or (443 if base_scheme == "https" else 80 if base_scheme == "http" else None)
+        session_port = session.port or (
+            443 if session_scheme == "https" else 80 if session_scheme == "http" else None
+        )
+        if session.username is not None or session.password is not None:
+            raise RuntimeError("upload service returned a credential-bearing session URL")
+        same_origin = (
+            base_scheme,
+            (base.hostname or "").lower().rstrip("."),
+            base_port,
+        ) == (
+            session_scheme,
+            (session.hostname or "").lower().rstrip("."),
+            session_port,
+        )
+    except ValueError as error:
+        raise RuntimeError("upload service returned a malformed session URL") from error
+
+    if not same_origin:
+        raise RuntimeError("upload service returned a cross-origin session URL")
+    return session_url
+
+
 def _file_from_payload(payload: Any) -> Optional[dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
@@ -75,13 +106,21 @@ async def _wait_until_active(
         await asyncio.sleep(delay)
         delay = min(delay * 1.6, POLL_MAX_DELAY)
         try:
-            response = await client.get(
-                f"{base_url}/{name}", headers={"x-goog-api-key": key}, timeout=timeout
+            response = await _provider.request(
+                client,
+                "GET",
+                f"{base_url}/{name}",
+                headers={"x-goog-api-key": key},
+                timeout=timeout,
             )
         except httpx.HTTPError:
             continue
         if response.status_code == 404:
             raise FilesApiUnsupported(f"{base_url}/{name} is not available")
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"file status check for {name} returned HTTP {response.status_code}"
+            )
         if response.status_code >= 400:
             continue
         try:
@@ -117,8 +156,13 @@ async def upload(
     }
     start_url = f"{upload_base(base_url)}/files"
     try:
-        start = await client.post(
-            start_url, headers=headers, json={"file": {"display_name": display_name}}, timeout=timeout
+        start = await _provider.request(
+            client,
+            "POST",
+            start_url,
+            headers=headers,
+            json={"file": {"display_name": display_name}},
+            timeout=timeout,
         )
     except httpx.HTTPError as error:
         raise RuntimeError(f"upload could not start: {type(error).__name__}") from error
@@ -136,12 +180,14 @@ async def upload(
             f"{start_url} accepted the request but returned no upload URL; "
             "the Files API is not usable here"
         )
+    session_url = _validated_session_url(base_url, session_url)
 
     try:
-        finish = await client.post(
+        finish = await _provider.request(
+            client,
+            "POST",
             session_url,
             headers={
-                "x-goog-api-key": key,
                 "Content-Length": str(len(content)),
                 "X-Goog-Upload-Offset": "0",
                 "X-Goog-Upload-Command": "upload, finalize",
@@ -163,11 +209,32 @@ async def upload(
 
     uri = file.get("uri")
     name = file.get("name") or ""
+    state = str(file.get("state") or "").upper()
     if not isinstance(uri, str) or not uri:
+        await delete(client, base_url, key, name, timeout=timeout)
         raise RuntimeError("upload finished but the service returned no file URI")
-
-    if str(file.get("state") or "").upper() == "PROCESSING" and name:
-        await _wait_until_active(client, base_url, key, name, timeout)
+    if state == "FAILED":
+        await delete(client, base_url, key, name, timeout=timeout)
+        raise RuntimeError(f"the service failed to process {name or 'the uploaded file'}")
+    if state == "PROCESSING":
+        if not name:
+            raise RuntimeError("upload is processing but the service returned no file name")
+        try:
+            if timeout is None:
+                await _wait_until_active(client, base_url, key, name, timeout)
+            else:
+                try:
+                    await asyncio.wait_for(
+                        _wait_until_active(client, base_url, key, name, timeout),
+                        timeout=max(0.001, timeout),
+                    )
+                except asyncio.TimeoutError as error:
+                    raise RuntimeError(f"timed out waiting for {name} to become active") from error
+        except BaseException:
+            # upload() has not returned yet, so its caller cannot run the normal
+            # finally cleanup. Delete the partially processed resource here.
+            await delete(client, base_url, key, name, timeout=timeout)
+            raise
 
     return UploadedFile(uri=uri, name=name, mime_type=mime_type)
 
@@ -184,6 +251,12 @@ async def delete(
     if not name:
         return
     try:
-        await client.delete(f"{base_url}/{name}", headers={"x-goog-api-key": key}, timeout=timeout)
-    except httpx.HTTPError:
+        await _provider.request(
+            client,
+            "DELETE",
+            f"{base_url}/{name}",
+            headers={"x-goog-api-key": key},
+            timeout=timeout,
+        )
+    except (httpx.HTTPError, RuntimeError):
         pass

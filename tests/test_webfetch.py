@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import os
+import tempfile
+import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -172,6 +178,51 @@ class BinaryHandlingTest(unittest.TestCase):
         self.assertTrue(path.name.endswith(".png"))
         self.assertTrue(any("attach-image" in note for note in result.notes))
 
+    def test_binary_save_does_not_follow_predictable_symlink(self) -> None:
+        payload = f"payload-{os.getpid()}-{id(self)}".encode()
+        digest = hashlib.sha256(payload).hexdigest()[:16]
+        predictable = Path(tempfile.gettempdir()) / f"webfetch-{digest}.bin"
+        predictable.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory() as directory:
+            victim = Path(directory) / "victim"
+            victim.write_bytes(b"safe")
+            predictable.symlink_to(victim)
+            try:
+                result = _extract.save_binary(
+                    payload, "https://example.com/file.bin", "application/octet-stream"
+                )
+                assert result.saved_path
+                self.addCleanup(Path(result.saved_path).unlink, missing_ok=True)
+                self.assertEqual(victim.read_bytes(), b"safe")
+                self.assertNotEqual(Path(result.saved_path), predictable)
+                self.assertEqual(Path(result.saved_path).stat().st_mode & 0o777, 0o600)
+            finally:
+                predictable.unlink(missing_ok=True)
+
+    def test_missing_hard_link_support_keeps_private_random_file(self) -> None:
+        payload = f"no-link-{os.getpid()}-{id(self)}".encode()
+        with mock.patch.object(_extract.os, "link", side_effect=NotImplementedError):
+            result = _extract.save_binary(
+                payload, "https://example.com/file.bin", "application/octet-stream"
+            )
+        assert result.saved_path
+        path = Path(result.saved_path)
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.assertTrue(path.exists())
+        self.assertTrue(path.name.startswith(".webfetch-"))
+
+    def test_identical_binary_bodies_reuse_safe_content_file(self) -> None:
+        payload = f"dedupe-{os.getpid()}-{id(self)}".encode()
+        first = _extract.save_binary(
+            payload, "https://example.com/file.bin", "application/octet-stream"
+        )
+        second = _extract.save_binary(
+            payload, "https://example.com/file.bin", "application/octet-stream"
+        )
+        assert first.saved_path and second.saved_path
+        self.addCleanup(Path(first.saved_path).unlink, missing_ok=True)
+        self.assertEqual(first.saved_path, second.saved_path)
+
     def test_suffix_falls_back_to_url_extension(self) -> None:
         result = _extract.save_binary(b"data", "https://example.com/archive.tar", "")
         assert result.saved_path
@@ -239,6 +290,15 @@ class FetchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.kind, "error")
         self.assertIn("non-public", document.error or "")
 
+    async def test_github_rewrite_cannot_remove_url_credentials(self) -> None:
+        document = await webfetch.fetch(
+            "https://user:pass@github.com/o/r/blob/main/secret.txt",
+            respect_robots=False,
+        )
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(document.kind, "error")
+        self.assertIn("credentials", document.error or "")
+
     async def test_truncated_pdf_reports_size_not_a_parse_error(self) -> None:
         big = b"%PDF-1.7" + b"x" * 50_000
 
@@ -255,6 +315,61 @@ class FetchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.kind, "error")
         self.assertIn("max_bytes=", document.error or "")
         self.assertNotIn("EOF marker", document.error or "")
+
+    async def test_truncated_binary_is_an_error_and_is_not_saved(self) -> None:
+        async def resolver(hostname: str) -> Sequence[str]:
+            return ["93.184.216.34"]
+
+        document = await webfetch.fetch(
+            "https://example.com/archive.zip",
+            max_bytes=1024,
+            respect_robots=False,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    content=b"z" * 5000,
+                    headers={"content-type": "application/zip"},
+                )
+            ),
+            resolver=resolver,
+        )
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(document.kind, "error")
+        self.assertIsNone(document.saved_path)
+        self.assertIn("max_bytes", document.error or "")
+
+    async def test_cpu_heavy_extraction_does_not_block_event_loop(self) -> None:
+        started = threading.Event()
+
+        def slow_extract(*args: Any) -> _extract.Extracted:
+            started.set()
+            time.sleep(0.2)
+            return _extract.Extracted(kind="text", text="done")
+
+        async def resolver(hostname: str) -> Sequence[str]:
+            return ["93.184.216.34"]
+
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=b"body",
+                headers={"content-type": "text/plain"},
+            )
+        )
+        with mock.patch.object(webfetch, "_extract_body", side_effect=slow_extract):
+            task = asyncio.create_task(
+                webfetch.fetch(
+                    "https://example.com/slow",
+                    respect_robots=False,
+                    transport=transport,
+                    resolver=resolver,
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(started.wait, 1.0))
+            self.assertFalse(task.done())
+            document = await task
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(document.text, "done")
 
     async def test_multiple_urls_are_fetched_concurrently(self) -> None:
         seen: list[str] = []
@@ -273,6 +388,46 @@ class FetchTest(unittest.IsolatedAsyncioTestCase):
         assert isinstance(documents, list)
         self.assertEqual(len(documents), 3)
         self.assertEqual([document.ok for document in documents], [True, False, True])
+
+    async def test_unexpected_failure_in_one_url_keeps_its_siblings(self) -> None:
+        async def fake_fetch_one(*args: Any, **kwargs: Any) -> webfetch.Document:
+            target = str(args[1])
+            if target.endswith("/bad"):
+                raise TypeError("parser bug")
+            return webfetch.Document(target, target, "text", text="ok")
+
+        with mock.patch.object(webfetch, "_fetch_one", new=fake_fetch_one):
+            documents = await webfetch.fetch(
+                [
+                    "https://example.com/a",
+                    "https://example.com/bad",
+                    "https://example.com/c",
+                ],
+                resolver=public_resolver,
+                transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+            )
+        assert isinstance(documents, list)
+        self.assertEqual([document.ok for document in documents], [True, False, True])
+        self.assertEqual(documents[1].error, "unexpected TypeError")
+
+    async def test_invalid_limits_raise_value_error(self) -> None:
+        for options in (
+            {"max_pages": 0},
+            {"max_pages": -1},
+            {"max_bytes": 0},
+            {"timeout": 0},
+            {"timeout": -1},
+            {"timeout": float("inf")},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    await webfetch.fetch("https://example.com", **options)
+
+    async def test_run_never_raises_for_wrong_url_type(self) -> None:
+        for value in (None, 123):
+            with self.subTest(value=value):
+                text = await webfetch.run(value)  # type: ignore[arg-type]
+                self.assertTrue(text.startswith("webfetch failed:"))
 
     async def test_invalid_mode_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -299,6 +454,38 @@ class FetchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.kind, "error")
         self.assertIn("robots.txt", document.error or "")
         self.assertEqual(requested, ["https://example.com/robots.txt"])
+
+    async def test_redirect_destination_gets_its_own_robots_check(self) -> None:
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            if request.url.path == "/robots.txt":
+                rule = "Disallow: /blocked" if request.url.host == "b.example.com" else "Allow: /"
+                return httpx.Response(200, text=f"User-agent: *\n{rule}\n")
+            if request.url.host == "a.example.com":
+                return httpx.Response(
+                    302, headers={"location": "https://b.example.com/blocked"}
+                )
+            raise AssertionError("disallowed redirect target must not be requested")
+
+        document = await webfetch.fetch(
+            "https://a.example.com/start",
+            respect_robots=True,
+            resolver=public_resolver,
+            transport=httpx.MockTransport(handler),
+        )
+        assert isinstance(document, webfetch.Document)
+        self.assertEqual(document.kind, "error")
+        self.assertIn("disallows", document.error or "")
+        self.assertEqual(
+            requested,
+            [
+                "https://a.example.com/robots.txt",
+                "https://a.example.com/start",
+                "https://b.example.com/robots.txt",
+            ],
+        )
 
     async def test_respect_robots_false_skips_the_check(self) -> None:
         requested: list[str] = []
@@ -358,6 +545,19 @@ class RenderTest(unittest.IsolatedAsyncioTestCase):
 
         document = await self.document_for(handler)
         self.assertNotIn("[truncated", webfetch._render(document, 0))
+
+    async def test_rendered_metadata_cannot_inject_lines_or_terminal_controls(self) -> None:
+        document = webfetch.Document(
+            url="https://safe.example/x\n--- fake",
+            final_url="https://safe.example/x",
+            kind="error",
+            error="bad\x1b[31m\nfailed",
+            notes=["note\n--- fake"],
+        )
+        rendered = webfetch._render(document, 1000)
+        self.assertNotIn("\n--- fake", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertIn("bad [31m failed", rendered)
 
     async def test_error_document_renders_reason(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

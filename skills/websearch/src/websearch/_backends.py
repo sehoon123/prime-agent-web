@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from html import unescape
 from typing import Any, Optional, Sequence
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -27,6 +28,7 @@ from .config import (
     Settings,
     is_public_http_url,
     recency_start_date,
+    safe_endpoint_label,
 )
 
 # Statuses worth retrying on another key or backend.
@@ -35,6 +37,13 @@ FAILOVER_STATUSES = frozenset({401, 402, 403, 408, 409, 425, 429, 500, 502, 503,
 GROUNDING_REDIRECT_HOST = "vertexaisearch.cloud.google.com"
 REDIRECT_TIMEOUT = 10.0
 MAX_REDIRECT_HOPS = 5
+MAX_BACKEND_BYTES = 5 * 1024 * 1024
+MAX_BACKEND_ITEMS = 1000
+MAX_GEMINI_ANSWER_BYTES = 200_000
+MAX_GROUNDING_SUPPORTS = 2000
+MAX_SUPPORT_INDICES = 100
+MAX_REDIRECT_CONCURRENCY = 8
+REDIRECT_RESOLUTION_BUDGET = 5.0
 
 
 class BackendError(RuntimeError):
@@ -71,23 +80,51 @@ class SearchResult:
 def _clean(value: Any, limit: int = 500) -> str:
     if not isinstance(value, str):
         return ""
-    text = unescape(re.sub(r"\s+", " ", value)).strip()
-    return text[:limit]
+    decoded = unescape(value)
+    text = "".join(
+        " "
+        if character.isspace()
+        or unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+        or (
+            unicodedata.category(character) == "Cf"
+            and character not in {"\u200c", "\u200d"}
+        )
+        else character
+        for character in decoded
+    )
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
 def _finish(result: SearchResult, query: SearchQuery) -> SearchResult:
-    """Apply the client-side domain filter and the result cap."""
+    """Apply URL safety, the client-side domain filter, and the result cap."""
     kept: list[ResultItem] = []
     for item in result.items:
-        if query.allows(item.url):
+        item.url = item.url.strip()
+        if is_public_http_url(item.url) and query.allows(unescape(item.url)):
             kept.append(item)
         else:
             result.dropped += 1
     result.items = kept[: query.num_results]
+    if (query.include_domains or query.exclude_domains) and not result.items:
+        # A provider-generated answer cannot be proven in-scope without at least
+        # one surviving supporting URL.
+        result.answer = None
     return result
 
 
-def _raise_for_status(response: httpx.Response, backend: str) -> None:
+def _redact_known(text: str, secrets: Sequence[str]) -> str:
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if not secret:
+            continue
+        text = text.replace(secret, "***")
+    return text
+
+
+def _raise_for_status(
+    response: httpx.Response,
+    backend: str,
+    secrets: Sequence[str] = (),
+) -> None:
     if response.status_code < 400:
         return
     detail = ""
@@ -101,7 +138,8 @@ def _raise_for_status(response: httpx.Response, backend: str) -> None:
                 detail = error
             detail = detail or str(payload.get("message") or "")
     except ValueError:
-        detail = response.text[:200]
+        detail = response.text
+    detail = _redact_known(detail, secrets)
     message = f"{backend} returned HTTP {response.status_code}"
     if detail:
         message = f"{message}: {_clean(detail, 200)}"
@@ -112,14 +150,67 @@ def _raise_for_status(response: httpx.Response, backend: str) -> None:
     )
 
 
-async def _request(client: httpx.AsyncClient, backend: str, method: str, url: str, **kwargs: Any) -> httpx.Response:
+async def _request(
+    client: httpx.AsyncClient,
+    backend: str,
+    method: str,
+    url: str,
+    *,
+    secrets: Sequence[str] = (),
+    **kwargs: Any,
+) -> httpx.Response:
+    """Issue one provider request without eagerly buffering an unbounded body."""
     try:
-        response = await client.request(method, url, **kwargs)
+        follow_redirects = bool(kwargs.pop("follow_redirects", False))
+        request = client.build_request(method, url, **kwargs)
+        request.headers["accept-encoding"] = "identity"
+        response = await client.send(
+            request, stream=True, follow_redirects=follow_redirects
+        )
+        try:
+            encoding = response.headers.get("content-encoding", "").strip().lower()
+            if encoding not in ("", "identity"):
+                raise BackendError(
+                    f"{backend} ignored identity encoding ({encoding})",
+                    retryable=False,
+                )
+            content = bytearray()
+            if response.is_stream_consumed:
+                content.extend(response.content[: MAX_BACKEND_BYTES + 1])
+            else:
+                async for chunk in response.aiter_raw(chunk_size=65536):
+                    remaining = MAX_BACKEND_BYTES + 1 - len(content)
+                    if remaining <= 0:
+                        break
+                    content.extend(chunk[:remaining])
+                    if len(content) > MAX_BACKEND_BYTES:
+                        break
+        finally:
+            await response.aclose()
+    except BackendError:
+        raise
     except httpx.HTTPError as error:
-        raise BackendError(f"{backend} failed before an HTTP response: {type(error).__name__}") from error
-    _raise_for_status(response, backend)
-    return response
+        raise BackendError(
+            f"{backend} failed before a complete HTTP response: {type(error).__name__}"
+        ) from error
 
+    if len(content) > MAX_BACKEND_BYTES:
+        raise BackendError(
+            f"{backend} response exceeded {MAX_BACKEND_BYTES:,} bytes",
+            retryable=False,
+        )
+    bounded = httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        content=bytes(content),
+        request=request,
+    )
+    _raise_for_status(bounded, backend, secrets)
+    return bounded
+
+
+def _entries(value: Any) -> Sequence[Any]:
+    return value[:MAX_BACKEND_ITEMS] if isinstance(value, list) else ()
 
 def _json_body(response: httpx.Response, backend: str) -> dict[str, Any]:
     try:
@@ -136,56 +227,111 @@ def _json_body(response: httpx.Response, backend: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def _is_grounding_redirect(url: str) -> bool:
+    """Match the Google redirector by hostname, never by attacker-controlled text."""
+    try:
+        parts = urlparse(url)
+        return (
+            parts.scheme == "https"
+            and (parts.hostname or "").lower().rstrip(".") == GROUNDING_REDIRECT_HOST
+            and parts.port in (None, 443)
+            and "@" not in parts.netloc
+        )
+    except ValueError:
+        return False
+
+
 async def _resolve_redirect(client: httpx.AsyncClient, url: str) -> str:
     """Resolve a grounding redirect to its publisher URL without fetching it.
 
-    Uses `follow_redirects=False` and reads `Location`, so the target host is
-    never contacted, and rejects any hop that is not a public http(s) URL.
+    Uses `follow_redirects=False` and reads `Location`, so the publisher host is
+    never contacted. Only the exact Google redirector hostname may receive HEAD.
     """
+    if not is_public_http_url(url) or not _is_grounding_redirect(url):
+        return url
     current = url
     for _ in range(MAX_REDIRECT_HOPS):
         try:
-            response = await client.request(
+            request = client.build_request(
                 "HEAD",
                 current,
-                follow_redirects=False,
+                headers={"accept-encoding": "identity"},
                 timeout=REDIRECT_TIMEOUT,
             )
+            response = await client.send(
+                request, stream=True, follow_redirects=False
+            )
+            try:
+                location = response.headers.get("location")
+            finally:
+                await response.aclose()
         except httpx.HTTPError:
             return url
-        location = response.headers.get("location")
         if not location:
             return url if current == url else current
         candidate = urljoin(current, location)
         if not is_public_http_url(candidate):
             return url
         current = candidate
-        if GROUNDING_REDIRECT_HOST not in urlparse(current).netloc:
+        if not _is_grounding_redirect(current):
             return current
     return url
 
 
-async def _resolve_redirects(client: httpx.AsyncClient, items: Sequence[ResultItem]) -> None:
-    targets = [item for item in items if GROUNDING_REDIRECT_HOST in item.url]
+async def _resolve_redirects(
+    client: httpx.AsyncClient,
+    items: Sequence[ResultItem],
+    *,
+    max_candidates: int,
+) -> None:
+    targets = [
+        item for item in items if _is_grounding_redirect(item.url)
+    ][:max_candidates]
     if not targets:
         return
-    resolved = await asyncio.gather(
-        *(_resolve_redirect(client, item.url) for item in targets),
-        return_exceptions=True,
-    )
-    for item, value in zip(targets, resolved):
-        if isinstance(value, str) and value:
-            item.url = value
+    semaphore = asyncio.Semaphore(MAX_REDIRECT_CONCURRENCY)
+
+    async def resolve(item: ResultItem) -> None:
+        async with semaphore:
+            value = await _resolve_redirect(client, item.url)
+            if value:
+                item.url = value
+
+    tasks = [asyncio.create_task(resolve(item)) for item in targets]
+    try:
+        done, pending = await asyncio.wait(
+            tasks, timeout=REDIRECT_RESOLUTION_BUDGET
+        )
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task in done:
+        # A failed redirect is left unresolved and dropped by _finish_grounded.
+        try:
+            task.result()
+        except (Exception, asyncio.CancelledError):
+            pass
 
 
 async def _gemini_studio_models(client: httpx.AsyncClient, endpoint: GeminiEndpoint, key: str) -> tuple[str, ...]:
     """List models for the public endpoint, falling back to known ids."""
     try:
-        response = await client.get(f"{endpoint.base_url}/models", headers={"x-goog-api-key": key})
-        if response.status_code >= 400:
-            return AI_STUDIO_FALLBACK_MODELS
+        response = await _request(
+            client,
+            "gemini models",
+            "GET",
+            f"{endpoint.base_url}/models",
+            secrets=(key,),
+            headers={"x-goog-api-key": key},
+        )
         payload = response.json()
-    except (httpx.HTTPError, ValueError):
+    except (BackendError, ValueError):
         return AI_STUDIO_FALLBACK_MODELS
     names: list[str] = []
     models = payload.get("models") if isinstance(payload, dict) else None
@@ -203,44 +349,79 @@ async def _gemini_studio_models(client: httpx.AsyncClient, endpoint: GeminiEndpo
     return tuple(names) or AI_STUDIO_FALLBACK_MODELS
 
 
-def _annotate_citations(answer: str, metadata: dict[str, Any], count: int) -> str:
-    """Append [n] markers using groundingSupports, so claims map to sources."""
+def _annotate_citations(
+    answer: str,
+    metadata: dict[str, Any],
+    source_numbers: dict[int, int],
+    part_ranges: dict[int, tuple[int, int]],
+) -> str:
+    """Append markers whose chunk indices still map to displayed sources."""
     supports = metadata.get("groundingSupports")
-    if not answer or not isinstance(supports, list) or count == 0:
-        return answer
+    if not answer or not isinstance(supports, list) or not source_numbers:
+        return answer.strip()
 
-    # Collect (end offset -> source numbers) and insert markers back to front so
-    # earlier offsets stay valid.
-    insertions: list[tuple[int, str]] = []
-    for support in supports:
+    encoded = answer.encode("utf-8")
+    # Merge supports at the same byte offset. Inserting them separately reverses
+    # provider order and can duplicate the same source marker.
+    insertions: dict[int, set[int]] = {}
+    for support in supports[:MAX_GROUNDING_SUPPORTS]:
         if not isinstance(support, dict):
             continue
         segment = support.get("segment")
         indices = support.get("groundingChunkIndices")
         if not isinstance(segment, dict) or not isinstance(indices, list):
             continue
-        end = segment.get("endIndex")
-        if not isinstance(end, int):
+        relative_end = segment.get("endIndex")
+        if "partIndex" in segment:
+            part_index = segment.get("partIndex")
+        else:
+            part_index = next(iter(part_ranges)) if len(part_ranges) == 1 else 0
+        if type(relative_end) is not int or type(part_index) is not int:
             continue
-        numbers = sorted({index + 1 for index in indices if isinstance(index, int) and 0 <= index < count})
-        if numbers:
-            insertions.append((end, "".join(f"[{number}]" for number in numbers)))
-
-    if not insertions:
-        return answer
-    encoded = answer.encode("utf-8")
-    for end, marker in sorted(insertions, key=lambda pair: pair[0], reverse=True):
-        if not 0 < end <= len(encoded):
+        part_range = part_ranges.get(part_index)
+        if part_range is None:
             continue
-        # Providers disagree on whether a segment includes its trailing space, so
-        # step back over whitespace and keep the marker attached to the sentence.
-        while end > 0 and encoded[end - 1 : end].isspace():
+        part_start, part_end = part_range
+        end = part_start + relative_end
+        if not part_start < end <= part_end:
+            continue
+        if end > len(encoded) or (
+            end < len(encoded) and encoded[end] & 0xC0 == 0x80
+        ):
+            continue
+        while end > part_start and encoded[end - 1 : end].isspace():
             end -= 1
-        encoded = encoded[:end] + marker.encode("utf-8") + encoded[end:]
-    return encoded.decode("utf-8", errors="ignore")
+        numbers = {
+            source_numbers[index]
+            for index in indices[:MAX_SUPPORT_INDICES]
+            if type(index) is int and index in source_numbers
+        }
+        if numbers and end > 0:
+            insertions.setdefault(end, set()).update(numbers)
+
+    pieces: list[bytes] = []
+    cursor = 0
+    for end in sorted(insertions):
+        pieces.append(encoded[cursor:end])
+        pieces.append(
+            "".join(f"[{number}]" for number in sorted(insertions[end])).encode("utf-8")
+        )
+        cursor = end
+    pieces.append(encoded[cursor:])
+    return b"".join(pieces).decode("utf-8").strip()
 
 
-def _parse_gemini(payload: dict[str, Any], limit: int) -> tuple[Optional[str], list[ResultItem], list[str]]:
+def _parse_gemini(
+    payload: dict[str, Any],
+) -> tuple[
+    Optional[str],
+    list[ResultItem],
+    list[str],
+    dict[str, Any],
+    dict[int, int],
+    dict[int, tuple[int, int]],
+]:
+    """Parse grounding data while retaining each provider chunk's item index."""
     candidates = payload.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise BackendError("gemini returned no candidates", retryable=False)
@@ -248,35 +429,114 @@ def _parse_gemini(payload: dict[str, Any], limit: int) -> tuple[Optional[str], l
 
     content = candidate.get("content")
     parts = content.get("parts") if isinstance(content, dict) else None
-    answer = ""
+    answer_parts: list[str] = []
+    part_ranges: dict[int, tuple[int, int]] = {}
+    byte_offset = 0
     if isinstance(parts, list):
-        answer = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
+        for part_index, part in enumerate(parts):
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str):
+                encoded_length = len(text.encode("utf-8"))
+                part_ranges[part_index] = (byte_offset, byte_offset + encoded_length)
+                answer_parts.append(text)
+                byte_offset += encoded_length
+    answer = "".join(answer_parts)
+    answer_bytes = answer.encode("utf-8")
+    if len(answer_bytes) > MAX_GEMINI_ANSWER_BYTES:
+        cut = MAX_GEMINI_ANSWER_BYTES
+        while cut > 0 and answer_bytes[cut] & 0xC0 == 0x80:
+            cut -= 1
+        answer = (
+            answer_bytes[:cut].decode("utf-8")
+            + f"\n\n[provider answer truncated at {MAX_GEMINI_ANSWER_BYTES:,} UTF-8 bytes]"
+        )
+        part_ranges = {
+            index: (start, min(end, cut))
+            for index, (start, end) in part_ranges.items()
+            if start < cut
+        }
 
     metadata = candidate.get("groundingMetadata")
     metadata = metadata if isinstance(metadata, dict) else {}
 
     items: list[ResultItem] = []
-    seen: set[str] = set()
-    for chunk in metadata.get("groundingChunks") or []:
-        if not isinstance(chunk, dict):
-            continue
-        web = chunk.get("web")
-        if not isinstance(web, dict):
-            continue
-        url = web.get("uri")
-        if not isinstance(url, str) or url in seen:
-            continue
-        seen.add(url)
-        items.append(ResultItem(title=_clean(web.get("title")) or url, url=url))
-        if len(items) >= max(limit, 10):
-            break
+    item_by_url: dict[str, int] = {}
+    chunk_to_item: dict[int, int] = {}
+    chunks = metadata.get("groundingChunks")
+    if isinstance(chunks, list):
+        for chunk_index, chunk in enumerate(chunks[:MAX_BACKEND_ITEMS]):
+            if not isinstance(chunk, dict):
+                continue
+            web = chunk.get("web")
+            if not isinstance(web, dict):
+                continue
+            url = web.get("uri")
+            if not isinstance(url, str):
+                continue
+            url = url.strip()
+            if not url:
+                continue
+            item_index = item_by_url.get(url)
+            if item_index is None:
+                if len(items) >= MAX_BACKEND_ITEMS:
+                    continue
+                item_index = len(items)
+                item_by_url[url] = item_index
+                items.append(ResultItem(title=_clean(web.get("title")) or url, url=url))
+            chunk_to_item[chunk_index] = item_index
 
-    if answer:
-        answer = _annotate_citations(answer, metadata, len(items))
-    queries = [q for q in (metadata.get("webSearchQueries") or []) if isinstance(q, str)]
-    if not answer and not items:
+    queries = [
+        cleaned
+        for query in _entries(metadata.get("webSearchQueries"))
+        if (cleaned := _clean(query, 500))
+    ]
+    if not answer.strip() and not items:
         raise BackendError("gemini returned no grounded content", retryable=False)
-    return (answer or None), items, queries
+    return (
+        answer if answer.strip() else None,
+        items,
+        queries,
+        metadata,
+        chunk_to_item,
+        part_ranges,
+    )
+
+
+def _finish_grounded(
+    items: list[ResultItem],
+    chunk_to_item: dict[int, int],
+    query: SearchQuery,
+) -> tuple[list[ResultItem], dict[int, int], int]:
+    """Filter resolved sources and map original chunks to final source numbers."""
+    kept: list[ResultItem] = []
+    item_to_source: dict[int, int] = {}
+    source_by_url: dict[str, int] = {}
+    dropped = 0
+    for item_index, item in enumerate(items):
+        item.url = item.url.strip()
+        if (
+            _is_grounding_redirect(item.url)
+            or _is_grounding_redirect(unescape(item.url))
+            or not is_public_http_url(item.url)
+            or not query.allows(unescape(item.url))
+        ):
+            dropped += 1
+            continue
+        source_number = source_by_url.get(item.url)
+        if source_number is None:
+            if len(kept) >= query.num_results:
+                continue
+            kept.append(item)
+            source_number = len(kept)
+            source_by_url[item.url] = source_number
+        item_to_source[item_index] = source_number
+
+    chunk_to_source = {
+        chunk_index: item_to_source[item_index]
+        for chunk_index, item_index in chunk_to_item.items()
+        if item_index in item_to_source
+    }
+    return kept, chunk_to_source, dropped
 
 
 async def search_gemini(client: httpx.AsyncClient, query: SearchQuery, settings: Settings) -> SearchResult:
@@ -289,9 +549,11 @@ async def search_gemini(client: httpx.AsyncClient, query: SearchQuery, settings:
     errors: list[str] = []
     for endpoint in endpoints:
         for key in endpoint.keys:
-            usable = endpoint if endpoint.models else endpoint.with_models(
-                await _gemini_studio_models(client, endpoint, key)
-            )
+            # A pinned model is already usable evidence; do not delay it behind a
+            # model-list request that a gateway may not expose.
+            usable = endpoint
+            if not settings.gemini_model and not endpoint.models:
+                usable = endpoint.with_models(await _gemini_studio_models(client, endpoint, key))
             model = usable.pick_model(settings.gemini_model)
             if not model:
                 errors.append(f"{endpoint.label}: no usable model")
@@ -301,30 +563,60 @@ async def search_gemini(client: httpx.AsyncClient, query: SearchQuery, settings:
             headers = {"x-goog-api-key": key, "content-type": "application/json"}
             # google_search is the Gemini 2+ tool; google_search_retrieval is the
             # older name still required by some gateways.
+            retry_next_key = True
             for tool in ({"google_search": {}}, {"google_search_retrieval": {}}):
                 body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "tools": [tool]}
                 try:
-                    response = await _request(client, "gemini", "POST", url, headers=headers, json=body)
-                    answer, items, queries = _parse_gemini(_json_body(response, "gemini"), query.num_results)
+                    response = await _request(
+                        client,
+                        "gemini",
+                        "POST",
+                        url,
+                        secrets=settings.secrets,
+                        headers=headers,
+                        json=body,
+                    )
+                    (
+                        answer,
+                        items,
+                        queries,
+                        metadata,
+                        chunk_to_item,
+                        part_ranges,
+                    ) = _parse_gemini(_json_body(response, "gemini"))
                 except BackendError as error:
                     errors.append(f"{endpoint.label}/{model}: {error}")
-                    # 400 usually means this gateway rejected the tool shape;
-                    # anything else is a key or endpoint problem, so move on.
+                    # A 400 may mean this gateway needs the legacy tool shape.
+                    # If both shapes fail, another key would repeat the same error.
                     if error.status == 400:
+                        retry_next_key = False
                         continue
+                    retry_next_key = error.retryable
                     break
 
-                await _resolve_redirects(client, items)
-                return _finish(
-                    SearchResult(
-                        backend="gemini",
-                        detail=f"{usable.label}/{model}",
-                        answer=answer,
-                        items=items,
-                        queries=queries,
-                    ),
-                    query,
+                await _resolve_redirects(
+                    client,
+                    items,
+                    max_candidates=max(10, query.num_results * 2),
                 )
+                items, source_numbers, dropped = _finish_grounded(items, chunk_to_item, query)
+                if (query.include_domains or query.exclude_domains) and not items:
+                    answer = None
+                if answer:
+                    answer = _annotate_citations(
+                        answer, metadata, source_numbers, part_ranges
+                    )
+                return SearchResult(
+                    backend="gemini",
+                    detail=f"{usable.label}/{model}",
+                    answer=answer,
+                    items=items,
+                    queries=queries,
+                    dropped=dropped,
+                )
+            if not retry_next_key:
+                break
+
     raise BackendError("; ".join(errors) or "every gemini endpoint failed")
 
 
@@ -349,6 +641,7 @@ async def search_serper(client: httpx.AsyncClient, query: SearchQuery, settings:
         "serper",
         "POST",
         "https://google.serper.dev/search",
+        secrets=settings.secrets,
         headers={"X-API-KEY": key, "content-type": "application/json"},
         json=body,
     )
@@ -366,7 +659,7 @@ async def search_serper(client: httpx.AsyncClient, query: SearchQuery, settings:
             answer_parts.append(" - ".join(part for part in (title, description) if part))
 
     items: list[ResultItem] = []
-    for entry in payload.get("organic") or []:
+    for entry in _entries(payload.get("organic")):
         if not isinstance(entry, dict):
             continue
         url = entry.get("link")
@@ -402,12 +695,13 @@ async def search_tavily(client: httpx.AsyncClient, query: SearchQuery, settings:
         "tavily",
         "POST",
         "https://api.tavily.com/search",
+        secrets=settings.secrets,
         headers={"authorization": f"Bearer {key}", "content-type": "application/json"},
         json=body,
     )
     payload = _json_body(response, "tavily")
     items: list[ResultItem] = []
-    for entry in payload.get("results") or []:
+    for entry in _entries(payload.get("results")):
         if not isinstance(entry, dict):
             continue
         url = entry.get("url")
@@ -441,6 +735,7 @@ async def search_brave(client: httpx.AsyncClient, query: SearchQuery, settings: 
         "brave",
         "GET",
         "https://api.search.brave.com/res/v1/web/search",
+        secrets=settings.secrets,
         headers={"X-Subscription-Token": key, "Accept": "application/json"},
         params=params,
     )
@@ -448,7 +743,7 @@ async def search_brave(client: httpx.AsyncClient, query: SearchQuery, settings: 
     web = payload.get("web")
     entries = web.get("results") if isinstance(web, dict) else None
     items: list[ResultItem] = []
-    for entry in entries or []:
+    for entry in _entries(entries):
         if not isinstance(entry, dict):
             continue
         url = entry.get("url")
@@ -479,12 +774,13 @@ async def search_exa(client: httpx.AsyncClient, query: SearchQuery, settings: Se
         "exa",
         "POST",
         "https://api.exa.ai/search",
+        secrets=settings.secrets,
         headers={"x-api-key": key, "content-type": "application/json"},
         json=body,
     )
     payload = _json_body(response, "exa")
     items: list[ResultItem] = []
-    for entry in payload.get("results") or []:
+    for entry in _entries(payload.get("results")):
         if not isinstance(entry, dict):
             continue
         url = entry.get("url")
@@ -509,12 +805,13 @@ async def search_searxng(client: httpx.AsyncClient, query: SearchQuery, settings
         "searxng",
         "GET",
         f"{base}/search",
+        secrets=settings.secrets,
         params=params,
         headers={"Accept": "application/json"},
     )
     payload = _json_body(response, "searxng")
     items: list[ResultItem] = []
-    for entry in payload.get("results") or []:
+    for entry in _entries(payload.get("results")):
         if not isinstance(entry, dict):
             continue
         url = entry.get("url")
@@ -524,7 +821,12 @@ async def search_searxng(client: httpx.AsyncClient, query: SearchQuery, settings
     if not items:
         raise BackendError("searxng returned no results (instance may block format=json)", retryable=False)
     return _finish(
-        SearchResult(backend="searxng", detail=urlparse(base).netloc or base, items=items), query
+        SearchResult(
+            backend="searxng",
+            detail=urlparse(safe_endpoint_label(base)).netloc or "configured endpoint",
+            items=items,
+        ),
+        query,
     )
 
 
@@ -550,10 +852,12 @@ def _unwrap_ddg_url(href: str) -> str:
         parsed = urlparse(url)
     except ValueError:
         return url
-    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l"):
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (host == "duckduckgo.com" or host.endswith(".duckduckgo.com")) and parsed.path.startswith("/l"):
         target = parse_qs(parsed.query).get("uddg")
         if target:
-            return unquote(target[0])
+            # parse_qs has already decoded the query component exactly once.
+            return target[0]
     return url
 
 
@@ -610,14 +914,20 @@ async def search_ddg(client: httpx.AsyncClient, query: SearchQuery, settings: Se
                 "ddg",
                 "POST",
                 url,
+                secrets=settings.secrets,
                 headers={"user-agent": _DDG_USER_AGENT},
                 data=data,
-                follow_redirects=True,
+                follow_redirects=False,
             )
         except BackendError as error:
             errors.append(str(error))
             continue
 
+        if response.is_redirect:
+            errors.append(
+                f"{urlparse(url).netloc} redirected the request (HTTP {response.status_code})"
+            )
+            continue
         html = response.text
         items = _parse_ddg_with_bs4(html, want) or _parse_ddg_with_regex(html, want)
         if items:

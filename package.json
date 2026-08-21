@@ -1,6 +1,6 @@
 {
   "name": "prime-agent-web",
-  "version": "0.5.0",
+  "version": "0.6.2",
   "description": "Web access skills for Prime Agent: multi-backend search (Gemini Google-Search grounding, Tavily, Brave, Serper, Exa, SearXNG, DuckDuckGo) and SSRF-guarded page fetching with HTML-to-markdown, PDF extraction, page Q&A, video reading and scan transcription.",
   "keywords": [
     "pi-package",
@@ -38,11 +38,18 @@
     ]
   },
   "files": [
-    "skills",
+    "skills/websearch/SKILL.md",
+    "skills/websearch/pyproject.toml",
+    "skills/websearch/src/**/*.py",
+    "skills/webfetch/SKILL.md",
+    "skills/webfetch/pyproject.toml",
+    "skills/webfetch/src/**/*.py",
     "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "python3 -m unittest discover -s tests -t ."
+    "test": "PYTHONPATH=skills/websearch/src:skills/webfetch/src uv run --quiet --with httpx --with beautifulsoup4 --with markdownify --with pypdf --with tomli python -m unittest discover -s tests -t ."
   }
 }

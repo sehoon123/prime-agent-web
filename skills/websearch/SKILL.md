@@ -20,7 +20,7 @@ await websearch("cve-2026-1234", recency="week")            # day | week | month
 await websearch("rust async", domains="github.com,-reddit.com")  # "-" excludes
 await websearch("who won euro 2024", provider="ddg")        # force one backend
 await websearch("rust async runtimes", provider="all")      # every backend, concurrently
-await websearch("kernel panic", provider="gemini,ddg")      # explicit chain
+await websearch("kernel panic", provider="gemini,ddg")      # explicit concurrent fan-out
 help(websearch)                                             # full signature
 ```
 
@@ -36,6 +36,8 @@ answers = await asyncio.gather(*(websearch(q) for q in ["query a", "query b"]))
 
 ```python
 await websearch.backends()      # which backends are usable here, and why
+await websearch.health()        # per-backend cooldowns, with the evidence
+websearch.reset_health()        # forget recorded failures; back to static order
 websearch.clear_cache()         # drop the in-process result cache
 
 results = await websearch.search("prime agent", provider="all")   # raw objects
@@ -50,6 +52,15 @@ for result in results:
 `provider="auto"` (the default) walks this order and returns the first backend
 that produces results. Everything is optional and auto-detected; the output always
 ends with which backends were used, unconfigured, or failed.
+
+The chain also learns from this session's own trajectory: a backend that raises
+earns a cooldown starting at 120s and doubling per consecutive failure (capped at
+x8), and one success resets it. While cooling, it is skipped in `auto`, listed in
+the output as `cooled: ...`, and explained by `websearch.health()` - evidence,
+not guesswork. If the ready chain produces nothing at all, cooled backends get one
+last try before the search fails. Naming providers (single or comma-separated
+chain) or using `all` is an explicit request and is never refused;
+`PRIME_AGENT_WEBSEARCH_COOLDOWN=0` turns this off.
 
 | Backend | Credential | Notes |
 |---|---|---|
@@ -74,10 +85,11 @@ results are reported as a count.
 
 ## Environment overrides
 
-- `PRIME_AGENT_WEBSEARCH_PROVIDER` - default backend (`auto`, `all`, a name, or a comma-separated chain)
+- `PRIME_AGENT_WEBSEARCH_PROVIDER` - default backend (`auto`, a name, or `all`/a comma- or whitespace-separated concurrent fan-out)
 - `PRIME_AGENT_WEBSEARCH_NUM_RESULTS` - default result count (default 5)
 - `PRIME_AGENT_WEBSEARCH_TIMEOUT` - HTTP timeout in seconds (default 45)
 - `PRIME_AGENT_WEBSEARCH_CACHE_TTL` - in-process cache TTL in seconds, `0` disables (default 300)
+- `PRIME_AGENT_WEBSEARCH_COOLDOWN` - failure-cooldown base in seconds, `0` disables adaptive ordering (default 120)
 - `PRIME_AGENT_WEBSEARCH_GEMINI_MODEL` - pin the grounding model
 - `PRIME_AGENT_WEBSEARCH_KEY_ROTATOR` - path to a key-rotator config
 - `SEARXNG_URL` - SearXNG instance base URL
@@ -89,9 +101,15 @@ results are reported as a count.
   it as `HTTP 202`; that is surfaced as a rate-limit message, not "no results".
 - Identical repeated searches are served from a short-lived in-process cache to
   protect provider quota during agent loops.
-- API keys are redacted from all returned text and error messages.
+- API keys and basic-auth passwords are redacted from all returned text and errors.
+  A source URL containing a known bearer value is removed rather than leaked or
+  corrupted. A key attached to
+  a custom provider is never reused at a different origin.
+- Provider response bodies, parsed entry counts, generated answers and citation work
+  are bounded. Result URLs are safety/domain filtered before the output cap; an answer
+  with no in-scope supporting URL is discarded.
 - Grounding redirect links are resolved by reading `Location` without fetching the
-  target, and any redirect to a private, loopback, or link-local address is
-  refused.
+  target. Candidate count, concurrency and aggregate time are bounded; unsafe or
+  unresolved redirectors are discarded.
 - `!command` credential references in `auth.json` are not executed from the
   kernel; export the value or use a literal for those providers.

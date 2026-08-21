@@ -8,6 +8,8 @@ dist/
 venv/
 node_modules/
 .pytest_cache/
+.coverage
+htmlcov/
 .ruff_cache/
 .mypy_cache/
 .DS_Store

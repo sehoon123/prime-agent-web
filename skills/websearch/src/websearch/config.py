@@ -7,14 +7,22 @@ secret in an error message.
 
 from __future__ import annotations
 
+import html
 import ipaddress
 import json
+import math
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
+from functools import cached_property
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
+
+# Single source of truth lives in _health.py; this alias keeps the settings
+# layer from drifting away from what health() reports.
+from ._health import BASE_COOLDOWN
 
 GOOGLE_API = "google-generative-ai"
 AI_STUDIO_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -30,6 +38,11 @@ AI_STUDIO_FALLBACK_MODELS: tuple[str, ...] = (
 DEFAULT_NUM_RESULTS = 5
 DEFAULT_TIMEOUT = 45.0
 DEFAULT_CACHE_TTL = 300.0
+
+# Cooldown base for a backend that just failed (see _health.py): each
+# consecutive failure doubles it. PRIME_AGENT_WEBSEARCH_COOLDOWN overrides; 0
+# disables adaptive ordering entirely.
+DEFAULT_COOLDOWN = BASE_COOLDOWN
 MAX_NUM_RESULTS = 20
 MAX_QUERY_CHARS = 2000
 
@@ -73,32 +86,36 @@ def env_int(name: str, default: int) -> int:
 
 def env_float(name: str, default: float) -> float:
     try:
-        return float(os.environ[name])
+        value = float(os.environ[name])
     except (KeyError, ValueError):
         return default
+    return value if math.isfinite(value) else default
 
 
 def agent_dirs() -> tuple[Path, ...]:
-    """Config directories to read, most specific first.
+    """Return one coherent Prime Agent configuration root.
 
-    Honours the same overrides as Prime Agent itself, then falls back to the
-    default Prime Agent directory and finally to a pi directory, so the skill
-    also works on hosts that keep credentials there.
+    An explicit override is authoritative. Without one, the current Prime root
+    wins when it contains an agent configuration file; the legacy Pi root is
+    used only when Prime has no such file. Empty files remain authoritative.
+    Mixing files across roots can pair one installation's endpoint with another
+    installation's credential.
     """
-    candidates: list[Path] = []
     for name in ("PRIME_AGENT_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"):
         raw = env_str(name)
         if raw:
-            candidates.append(Path(raw).expanduser())
-    home = Path.home()
-    candidates.append(home / ".prime" / "agent")
-    candidates.append(home / ".pi" / "agent")
+            return (Path(raw).expanduser(),)
 
-    unique: list[Path] = []
-    for path in candidates:
-        if path not in unique:
-            unique.append(path)
-    return tuple(unique)
+    home = Path.home()
+    prime = home / ".prime" / "agent"
+    legacy = home / ".pi" / "agent"
+    config_names = ("auth.json", "models.json", "key-rotator.json")
+    if any((prime / name).is_file() for name in config_names):
+        return (prime,)
+    if any((legacy / name).is_file() for name in config_names):
+        return (legacy,)
+    # With no authoritative file in either location, prefer the current root.
+    return (prime,)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -116,11 +133,20 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def read_first_json(filename: str) -> dict[str, Any]:
-    """Read `filename` from the first agent directory that has a usable copy."""
+    """Read `filename` from the selected agent directory."""
     for directory in agent_dirs():
-        data = read_json(directory / filename)
-        if data:
-            return data
+        path = directory / filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if text.startswith("\ufeff"):
+            text = text[1:]
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
     return {}
 
 
@@ -195,6 +221,40 @@ _PRIVATE_HOST_SUFFIXES = (".local", ".internal", ".localdomain", ".home.arpa")
 _BLOCKED_HOSTS = frozenset({"localhost", "localhost.localdomain", "metadata", "metadata.google.internal"})
 
 
+def safe_endpoint_label(url: str) -> str:
+    """Describe a configured URL without exposing embedded basic-auth data."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "configured endpoint"
+    host = parts.hostname or ""
+    if not host:
+        return "configured endpoint"
+    display_host = f"[{host}]" if ":" in host else host
+    return f"{parts.scheme}://{display_host}" + (f":{port}" if port is not None else "")
+
+
+MAX_RESULT_URL_CHARS = 8192
+
+
+def _looks_like_noncanonical_ipv4(host: str) -> bool:
+    labels = host.split(".")
+    if not 1 <= len(labels) <= 4 or any(not label for label in labels):
+        return False
+    return all(
+        label.isdigit()
+        or (
+            label.lower().startswith("0x")
+            and len(label) > 2
+            and all(character in "0123456789abcdef" for character in label[2:].lower())
+        )
+        for label in labels
+    )
+
+
 def is_public_http_url(url: str) -> bool:
     """True when `url` is an http(s) URL that does not target a private host.
 
@@ -204,11 +264,25 @@ def is_public_http_url(url: str) -> bool:
     """
     from urllib.parse import urlsplit
 
+    if not isinstance(url, str) or len(url) > MAX_RESULT_URL_CHARS:
+        return False
+    decoded_url = html.unescape(url)
+    url = decoded_url
+    if any(
+        character.isspace()
+        or character == "\\"
+        or unicodedata.category(character) in {"Cc", "Cf", "Zl", "Zp"}
+        for character in decoded_url
+    ):
+        return False
     try:
         parts = urlsplit(url.strip())
+        _ = parts.port
     except ValueError:
         return False
     if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    if "%" in (parts.netloc or ""):
         return False
     if "@" in (parts.netloc or ""):  # credentials in the authority
         return False
@@ -219,14 +293,15 @@ def is_public_http_url(url: str) -> bool:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return "." in host  # a real registered name, not a bare internal label
-    return not (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
+        return (
+            "." in host and not _looks_like_noncanonical_ipv4(host)
+        )  # a real registered name, not a bare/internal or alternate numeric form
+    return bool(
+        getattr(address, "scope_id", None) is None
+        and address.is_global
+        and not address.is_reserved
+        and not address.is_multicast
+        and not getattr(address, "is_site_local", False)
     )
 
 
@@ -409,10 +484,9 @@ def load_rotator_keys() -> RotatorKeys:
     Absent or unreadable configs simply yield no extra keys.
     """
     override = env_str("PRIME_AGENT_WEBSEARCH_KEY_ROTATOR")
-    data: dict[str, Any] = {}
     if override:
         data = read_json(Path(override).expanduser())
-    if not data:
+    else:
         data = read_first_json("key-rotator.json")
     if not data:
         return RotatorKeys()
@@ -475,6 +549,7 @@ def gemini_endpoints(
     rotator = load_rotator_keys() if rotator is None else rotator
 
     endpoints: list[GeminiEndpoint] = []
+    claimed_generic_ids: set[str] = set()
     providers = models_json.get("providers")
     if isinstance(providers, dict):
         for provider_id, provider in providers.items():
@@ -483,6 +558,8 @@ def gemini_endpoints(
             base_url = provider.get("baseUrl")
             if not isinstance(base_url, str) or not base_url.strip():
                 continue
+            if provider_id in ("google", "gemini"):
+                claimed_generic_ids.add(provider_id)
             pool_keys = rotator.get(provider_id)
             keys = _dedupe(
                 [
@@ -506,7 +583,17 @@ def gemini_endpoints(
                 )
             )
 
-    studio = find_credential(auth, ("google", "gemini"), ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+    studio = find_credential(auth, (), ("GEMINI_API_KEY", "GOOGLE_API_KEY"))
+    if studio is None:
+        studio = find_credential(
+            auth,
+            tuple(
+                provider_id
+                for provider_id in ("google", "gemini")
+                if provider_id not in claimed_generic_ids
+            ),
+            (),
+        )
     if studio:
         endpoints.append(
             GeminiEndpoint(
@@ -543,20 +630,38 @@ class Settings:
     searxng_url: Optional[str]
     cache_ttl: float
     auth: dict[str, Any]
+    cooldown_base: float = DEFAULT_COOLDOWN
 
-    @property
+    @cached_property
     def secrets(self) -> tuple[str, ...]:
         """Every secret that must never appear in returned text."""
         values: list[str] = []
         for endpoint in self.gemini_endpoints:
             values.extend(endpoint.keys)
+            from urllib.parse import unquote, urlsplit
+
+            try:
+                parts = urlsplit(endpoint.base_url)
+                if parts.password:
+                    values.extend((parts.password, unquote(parts.password)))
+            except ValueError:
+                pass
         for name in _SIMPLE_CREDENTIALS:
             found = self.find_simple(name)
             if found:
                 values.append(found.value)
+        if self.searxng_url:
+            from urllib.parse import unquote, urlsplit
+
+            try:
+                parts = urlsplit(self.searxng_url)
+                if parts.password:
+                    values.extend((parts.password, unquote(parts.password)))
+            except ValueError:
+                pass
         return _dedupe(values)
 
-    @property
+    @cached_property
     def gemini_endpoints(self) -> tuple[GeminiEndpoint, ...]:
         return gemini_endpoints(auth=self.auth)
 
@@ -587,7 +692,7 @@ class Settings:
                 for endpoint in self.gemini_endpoints
             )
         if backend == "searxng":
-            return self.searxng_url or ""
+            return safe_endpoint_label(self.searxng_url) if self.searxng_url else ""
         found = self.find_simple(backend)
         return found.source if found else ""
 
@@ -616,7 +721,10 @@ def parse_order(provider: Optional[str], default_order: Sequence[str] = AUTO_ORD
 
 def wants_every_backend(provider: Optional[str]) -> bool:
     raw = (provider or env_str("PRIME_AGENT_WEBSEARCH_PROVIDER") or "auto").strip().lower()
-    return raw == "all" or "," in raw
+    if raw == "all":
+        return True
+    names = [part for part in raw.replace(" ", ",").split(",") if part.strip()]
+    return len(names) > 1
 
 
 def load_settings(
@@ -632,13 +740,22 @@ def load_settings(
     )
     count = max(1, min(MAX_NUM_RESULTS, count))
     seconds = timeout if timeout is not None else env_float("PRIME_AGENT_WEBSEARCH_TIMEOUT", DEFAULT_TIMEOUT)
+    if (
+        not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+        or seconds <= 0
+    ):
+        if timeout is not None:
+            raise ValueError("timeout must be a positive finite number")
+        seconds = DEFAULT_TIMEOUT
     searxng = env_str("SEARXNG_URL") or env_str("PRIME_AGENT_WEBSEARCH_SEARXNG_URL")
     return Settings(
         num_results=count,
-        timeout=max(1.0, seconds),
+        timeout=float(seconds),
         order=parse_order(provider),
         gemini_model=model or env_str("PRIME_AGENT_WEBSEARCH_GEMINI_MODEL"),
         searxng_url=searxng.rstrip("/") if searxng else None,
         cache_ttl=max(0.0, env_float("PRIME_AGENT_WEBSEARCH_CACHE_TTL", DEFAULT_CACHE_TTL)),
+        cooldown_base=max(0.0, env_float("PRIME_AGENT_WEBSEARCH_COOLDOWN", DEFAULT_COOLDOWN)),
         auth=read_first_json("auth.json"),
     )

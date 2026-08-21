@@ -4,6 +4,135 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-08-21
+
+### Fixed
+
+- **websearch cache correctness.** The effective Gemini model is now part of the
+  key, raw `search()` results cannot mutate cached entries, replacing an existing
+  full-cache key no longer evicts an unrelated entry, and `clear_cache()` prevents
+  an already-running search from repopulating the cleared cache.
+- **websearch health ordering and output.** Health is recorded when each backend
+  attempt actually completes, so an older `provider="all"` success cannot erase a
+  newer concurrent failure. Turning cooldown off clears active deadlines; expired
+  cooldowns are described as ready to retry rather than recovered; every
+  last-resort attempt is removed from `cooled:`; and cache hits no longer report
+  failures from the original network call. Backend names are not duplicated in
+  formatted failures.
+- **webfetch cache policy and invalidation.** `PRIME_AGENT_WEBFETCH_CACHE_TTL=0`
+  now disables writes as well as reads. Manual (`respect_robots=False`) and
+  autonomous fetches use separate entries. `clear_cache()` blocks late writes
+  from requests that were already running, and replacing an existing full-cache
+  key does not evict another document.
+- Documents backed by a mutable `saved_path` are no longer cached; a later call
+  refetches instead of returning a path the caller may have deleted or changed.
+- Package metadata, module versions, both User-Agent families, and the root Pi/npm
+  package now agree on `0.6.2`; contract tests keep them in sync. `npm test` now
+  supplies both source paths and an isolated dependency environment on a clean
+  checkout. The npm tarball now contains only skill source and required metadata,
+  including the linked security notes, never test bytecode or build artifacts.
+- **webfetch SSRF boundaries.** URL syntax and DNS safety now run before every local,
+  video, prompt and Gemini fallback tier. Robots retrieval uses the guarded stream,
+  redirected destinations get their own robots verdict, and native connections are
+  pinned to vetted DNS addresses to prevent rebinding between validation and connect,
+  while proxy/NO_PROXY routing is selected from the logical URL. Safe address failover
+  remains, exact-origin redirect cookies work, and cookies never cross logical origins
+  merely because hosts share an IP. NAT64-to-private, CGNAT, alternate numeric or
+  percent/entity-encoded authorities, multicast, site-local and Unicode control targets
+  are rejected.
+- **Gemini confidentiality and availability.** Provider echoes are redacted across
+  webfetch answers and errors, including short keys and decoded basic-auth values;
+  retrieved URLs containing a known credential are removed rather than rewritten. AI Studio endpoints with no static model list use
+  the documented fallback models. Resumable upload sessions cannot cross the
+  configured origin or receive the API key, and partially processed files are deleted
+  when validation, polling, timeout or cancellation fails. Credentials claimed by a
+  custom `google`/`gemini` provider never fail over to the public Studio origin, and
+  all Gemini/Files response bodies are bounded before JSON parsing.
+- **Bounded document handling.** Exact-size bodies are no longer marked truncated;
+  streaming retains at most one decoded byte over the cap, bounds transfer decoding,
+  and wraps read failures. Binary bodies use atomically published mode-`0600`
+  content-addressed temporary files without following or replacing existing paths.
+  The PDF inline threshold accounts for base64 expansion, and
+  `max_pages` also limits bytes sent to Gemini. Partial binary bodies are rejected,
+  concatenated gzip members are preserved, compressed wire length is not confused with
+  decoded length, and HTML/PDF extraction runs off the event loop.
+- **Grounding correctness.** Gemini citation markers now retain provider part-relative
+  byte offsets, survive output trimming, merge duplicate supports, and renumber after
+  unsafe, duplicate or domain-filtered sources are removed. Only the exact Google
+  grounding redirect hostname can receive a streamed `HEAD` request. Redirect candidate
+  count, concurrency and aggregate time are bounded, and unresolved redirectors are
+  dropped. Citation insertion is linear and work-capped, generated answers are capped,
+  safety/domain filtering precedes the result cap, and unsupported out-of-scope answers
+  are dropped.
+- Process-keyed configuration fingerprints prevent cached SearXNG or Gemini results
+  from crossing endpoint, model or credential rotations without retaining raw keys. Health reset now ignores old in-flight completions, and calling
+  `health()` while cooldown is off clears stale deadlines.
+- Per-URL unexpected webfetch failures become error Documents without losing sibling
+  batch results. DNS, robots and file-processing waits obey caller timeouts, malformed
+  ports are rejected, HTML meta charsets are honored, and user-facing `run()` calls
+  keep their never-raise contract for invalid argument types. Robots parses the bounded
+  RFC prefix and uses longest-match/Allow precedence, linear work-bounded wildcards,
+  anchors, and equivalent Unicode/UTF-8 percent normalization off the event loop.
+  Explicit prompts or `gemini=True` now return a clear model error instead of caching
+  a local dump that did not satisfy the request.
+
+### Changed
+
+- Refactored duplicated websearch health bookkeeping into the per-attempt path so
+  sequential, fan-out, and last-resort calls share one completion-order rule.
+  No new public API or capability was added.
+
+## [0.6.1] - 2026-08-21
+
+### Fixed
+
+- **websearch: cooled backends are a last resort, not a blind spot (regression).**
+  When every ready backend returned nothing, the automatic chain now retries the
+  cooled backends once before failing - restoring the pre-0.6 guarantee that an
+  automatic search only fails after all configured backends have seen the query.
+  A last-resort success clears that backend's `cooled:` entry from the output and
+  resets its health.
+- **websearch: cache hits no longer claim `cooled:` skips.** A cache hit attempts
+  nothing, so carrying the original call's skip list was stale information; hits
+  now never set `deferred`.
+- **websearch: truthful `health()` when the cooldown is disabled.** With
+  `PRIME_AGENT_WEBSEARCH_COOLDOWN=0`, accumulated failures were rendered as
+  "ok (recovered)"; they now read "N recent failure(s), cooldown off".
+- **webfetch: cache entries are isolated from caller mutation.** Documents are
+  copied on store and on hit (`notes`, `retrieved_urls` duplicated), so one
+  caller's annotations can no longer leak into later hits or poison the cache.
+- **User-Agent strings actually match the release.** The webfetch skill still
+  sent `/0.3`; both skills now send `/0.6.1`.
+- Single source for the cooldown base: `config.DEFAULT_COOLDOWN` aliases
+  `_health.BASE_COOLDOWN` instead of duplicating the value.
+
+## [0.6.0] - 2026-08-21
+
+### Added
+
+- **websearch: trajectory-driven backend health.** A backend whose call raises earns
+  a session-scoped cooldown starting at 120s (`PRIME_AGENT_WEBSEARCH_COOLDOWN`, `0`
+  disables) and doubling per consecutive failure, capped at x8; one success resets
+  it. The automatic `auto` chain skips cooled backends, the output trailer lists
+  them as `cooled: ...`, and new helpers expose the evidence:
+  `await websearch.health()` renders per-backend state and reasons,
+  `websearch.reset_health()` clears it. Explicit requests are never refused -
+  named providers and `provider="all"` attempt everything regardless of health.
+  An empty result set is nobody's fault and cools nothing down. State lives in
+  the process only: every fresh session starts from zero assumptions.
+- **webfetch: session document cache.** Successful fetches are reused within the
+  kernel session under a content key (URL, mode, prompt, gemini/model choice,
+  byte cap, page cap), default TTL 300s (`PRIME_AGENT_WEBFETCH_CACHE_TTL`, `0`
+  disables), at most 32 entries, documents over ~2M chars not stored. Hits return
+  a per-call copy annotated with a `from session cache` note; errors are never
+  cached. Injected `transport`/`resolver` bypass the cache entirely, keeping test
+  and custom-networking paths deterministic. New helper: `webfetch.clear_cache()`.
+
+### Changed
+
+- `backends()` now also reports the cooldown setting next to the cache line.
+- User-Agent strings bumped to `/0.6` in both skills.
+
 ## [0.5.0] - 2026-08-20
 
 ### Added
@@ -75,7 +204,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     and content taken from `<main>`/`<article>` when present.
   - PDF text per page with `--- page N ---` markers, page count and metadata title;
     scanned PDFs are reported as having no text layer.
-  - `mode="raw"` for exact bodies, `mode="text"` for plain text.
+  - `mode="raw"` for unprocessed decoded text, `mode="text"` for plain text.
   - Binaries written to a temp file with the path reported.
   - `github.com/o/r/blob/…` rewritten to `raw.githubusercontent.com`; a repository
     root gets a `git clone` hint instead of scraped HTML.

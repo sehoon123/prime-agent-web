@@ -93,6 +93,46 @@ CORP = config.GeminiEndpoint(
 )
 
 
+class RequestBoundsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_requests_force_identity_and_cap_streams(self) -> None:
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"x" * (backends.MAX_BACKEND_BYTES + 1)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers["accept-encoding"], "identity")
+            return httpx.Response(200, stream=Stream())
+
+        async with client_for(handler) as client:
+            with self.assertRaises(backends.BackendError) as ctx:
+                await backends._request(client, "test", "GET", "https://api.example/x")
+        self.assertIn("response exceeded", str(ctx.exception))
+
+
+class DomainAnswerTest(unittest.TestCase):
+    def test_safe_html_entities_in_url_are_not_rewritten(self) -> None:
+        url = "https://example.com/search?q=a&amp;b=c"
+        result = backends._finish(
+            backends.SearchResult("test", items=[backends.ResultItem("x", url)]),
+            config.SearchQuery("q"),
+        )
+        self.assertEqual(result.items[0].url, url)
+
+    def test_answer_is_dropped_without_in_scope_support(self) -> None:
+        result = backends.SearchResult(
+            backend="tavily",
+            answer="SECRET FROM BLOCKED DOMAIN",
+            items=[backends.ResultItem("blocked", "https://blocked.example/x")],
+        )
+        finished = backends._finish(
+            result,
+            config.SearchQuery("q", include_domains=("allowed.example",)),
+        )
+        self.assertIsNone(finished.answer)
+        self.assertTrue(finished.empty)
+        self.assertEqual(finished.dropped, 1)
+
+
 class GeminiBackendTest(unittest.IsolatedAsyncioTestCase):
     async def test_parses_answer_sources_and_queries(self) -> None:
         patch_endpoints(self, CORP)
@@ -155,7 +195,8 @@ class GeminiBackendTest(unittest.IsolatedAsyncioTestCase):
 
         urls = [item.url for item in result.items]
         self.assertNotIn("http://169.254.169.254/latest/meta-data/", urls)
-        self.assertIn(redirector, urls)  # unresolved, but never a private target
+        self.assertNotIn(redirector, urls)  # unresolved redirectors are not useful sources
+        self.assertGreaterEqual(result.dropped, 1)
 
     async def test_inline_citation_markers_from_grounding_supports(self) -> None:
         patch_endpoints(self, CORP)
@@ -180,6 +221,162 @@ class GeminiBackendTest(unittest.IsolatedAsyncioTestCase):
         async with client_for(lambda request: httpx.Response(200, json=payload)) as client:
             result = await backends.search_gemini(client, query_for(), settings_for())
         self.assertEqual(result.answer, "Spain won.[1] Argentina lost.[1][2]")
+
+    async def test_redirect_detection_never_matches_attacker_controlled_text(self) -> None:
+        requested: list[str] = []
+        item = backends.ResultItem(
+            "trap",
+            "http://169.254.169.254/latest?vertexaisearch.cloud.google.com",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(str(request.url))
+            return httpx.Response(200)
+
+        async with client_for(handler) as client:
+            await backends._resolve_redirects(client, [item], max_candidates=10)
+        self.assertEqual(requested, [])
+        result = backends._finish(backends.SearchResult("gemini", items=[item]), query_for())
+        self.assertEqual(result.items, [])
+        self.assertEqual(result.dropped, 1)
+
+    def test_grounding_filter_runs_before_result_cap(self) -> None:
+        answer = "Claim"
+        chunks = [
+            {"web": {"uri": f"http://10.0.0.{index + 1}/x", "title": "blocked"}}
+            for index in range(10)
+        ]
+        chunks.append(
+            {"web": {"uri": "https://allowed.example/x", "title": "allowed"}}
+        )
+        payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": answer}]},
+                    "groundingMetadata": {
+                        "groundingChunks": chunks,
+                        "groundingSupports": [
+                            {
+                                "segment": {"endIndex": len(answer)},
+                                "groundingChunkIndices": [10],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        parsed, items, _, metadata, chunk_map, ranges = backends._parse_gemini(payload)
+        kept, source_numbers, _ = backends._finish_grounded(
+            items,
+            chunk_map,
+            config.SearchQuery("q", include_domains=("allowed.example",)),
+        )
+        self.assertEqual([item.url for item in kept], ["https://allowed.example/x"])
+        self.assertEqual(
+            backends._annotate_citations(parsed or "", metadata, source_numbers, ranges),
+            "Claim[1]",
+        )
+
+    async def test_citations_are_renumbered_after_safety_and_domain_filtering(self) -> None:
+        patch_endpoints(self, CORP)
+        answer = "Grounded claim."
+        payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": None}, {"text": answer}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"uri": "http://169.254.169.254/latest", "title": "private"}},
+                            {"web": {"uri": "https://blocked.example/x", "title": "blocked"}},
+                            {"web": {"uri": "https://allowed.example/a", "title": "allowed"}},
+                            {"web": {"uri": "https://allowed.example/a", "title": "duplicate"}},
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {"partIndex": 1, "endIndex": len(answer)},
+                                "groundingChunkIndices": [0, 1, 2, 3],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        async with client_for(lambda request: httpx.Response(200, json=payload)) as client:
+            result = await backends.search_gemini(
+                client,
+                query_for(include_domains=("allowed.example",)),
+                settings_for(),
+            )
+
+        self.assertEqual([item.url for item in result.items], ["https://allowed.example/a"])
+        self.assertEqual(result.answer, "Grounded claim.[1]")
+        self.assertEqual(result.dropped, 2)
+
+    async def test_pinned_model_skips_unneeded_model_listing(self) -> None:
+        endpoint = config.GeminiEndpoint(
+            "model-less", "https://gw.example.com/v1beta", (), ("key",)
+        )
+        patch_endpoints(self, endpoint)
+        requested: list[tuple[str, str]] = []
+        payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "answer"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"uri": "https://example.com/x", "title": "x"}}
+                        ]
+                    },
+                }
+            ]
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append((request.method, str(request.url)))
+            if request.method == "GET":
+                raise AssertionError("a pinned model must not trigger model discovery")
+            return httpx.Response(200, json=payload)
+
+        async with client_for(handler) as client:
+            result = await backends.search_gemini(
+                client, query_for(), settings_for(gemini_model="pinned-model")
+            )
+        self.assertEqual(result.detail, "model-less/pinned-model")
+        self.assertTrue(all(method != "GET" for method, _ in requested))
+
+    async def test_citation_offsets_respect_raw_whitespace_and_part_index(self) -> None:
+        patch_endpoints(self, CORP)
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"text": "  First. "}, {"text": "Second."}]
+                    },
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"uri": "https://example.com/x", "title": "x"}}
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {"partIndex": 1, "endIndex": 7},
+                                "groundingChunkIndices": [0],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        async with client_for(lambda request: httpx.Response(200, json=payload)) as client:
+            result = await backends.search_gemini(client, query_for(), settings_for())
+        self.assertEqual(result.answer, "First. Second.[1]")
+
+        payload["candidates"][0]["content"] = {"parts": [{"text": "  Claim."}]}
+        payload["candidates"][0]["groundingMetadata"]["groundingSupports"][0]["segment"] = {
+            "endIndex": 8
+        }
+        async with client_for(lambda request: httpx.Response(200, json=payload)) as client:
+            result = await backends.search_gemini(client, query_for(), settings_for())
+        self.assertEqual(result.answer, "Claim.[1]")
 
     async def test_recency_and_domains_go_into_the_prompt(self) -> None:
         patch_endpoints(self, CORP)
@@ -446,6 +643,10 @@ class DuckDuckGoTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.items[0].title, "Real Page")
         self.assertEqual(result.items[1].url, "https://direct.example.com/two")
 
+    def test_redirect_target_is_decoded_exactly_once(self) -> None:
+        wrapped = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%252Fb"
+        self.assertEqual(backends._unwrap_ddg_url(wrapped), "https://example.com/a%2Fb")
+
     async def test_recency_uses_df_parameter(self) -> None:
         seen: list[bytes] = []
 
@@ -472,6 +673,26 @@ class DuckDuckGoTest(unittest.IsolatedAsyncioTestCase):
             ["https://real.example.com/page", "https://direct.example.com/two"],
         )
 
+    async def test_endpoint_redirect_is_not_followed_blindly(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            if request.url.host == "html.duckduckgo.com":
+                return httpx.Response(
+                    302,
+                    headers={"location": "http://169.254.169.254/latest/meta-data/"},
+                )
+            return httpx.Response(200, text=DDG_HTML)
+
+        async with client_for(handler) as client:
+            result = await backends.search_ddg(client, query_for(), settings_for())
+        self.assertTrue(result.items)
+        self.assertEqual(
+            calls,
+            ["https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"],
+        )
+
     async def test_rate_limit_is_reported_clearly(self) -> None:
         async with client_for(lambda request: httpx.Response(202, text="")) as client:
             with self.assertRaises(backends.BackendError) as ctx:
@@ -495,6 +716,22 @@ class DuckDuckGoTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RedactionTest(unittest.IsolatedAsyncioTestCase):
+    def test_clean_removes_html_encoded_and_terminal_controls(self) -> None:
+        self.assertEqual(backends._clean("Title&#10;Injected\x1b[31m"), "Title Injected [31m")
+        self.assertEqual(backends._clean("A&#x2028;INJECT\u202e"), "A INJECT")
+
+    def test_error_secret_is_redacted_before_detail_cutoff(self) -> None:
+        secret = "CUTOFF-SECRET-123"
+        response = httpx.Response(
+            400,
+            json={"error": {"message": "x" * 195 + secret}},
+            request=httpx.Request("GET", "https://api.example"),
+        )
+        with self.assertRaises(backends.BackendError) as ctx:
+            backends._raise_for_status(response, "provider", (secret,))
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertNotIn("CUTOFF-", str(ctx.exception))
+
     async def test_secret_echoed_by_provider_is_redacted(self) -> None:
         secret = "sk-super-secret-value-1234"
         patch_endpoints(
@@ -509,8 +746,9 @@ class RedactionTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(backends.BackendError) as ctx:
                     await backends.search_gemini(client, query_for(), settings_for())
         raw = str(ctx.exception)
-        self.assertIn(secret, raw)  # the backend may include it...
-        self.assertNotIn(secret, websearch._redact(raw, (secret,)))  # ...callers must not
+        self.assertNotIn(secret, raw)
+        self.assertIn("***", raw)
+        self.assertNotIn(secret, websearch._redact(raw, (secret,)))
 
 
 if __name__ == "__main__":

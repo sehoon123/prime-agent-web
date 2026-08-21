@@ -3,7 +3,7 @@
 # this skill overrides it by name, so occupying the same distribution slot keeps
 # the `websearch` import unambiguous in the kernel venv.
 name = "prime-agent-skill-websearch"
-version = "0.5.0"
+version = "0.6.2"
 description = "Multi-backend web search skill for Prime Agent (Gemini grounding, Tavily, Brave, Serper, Exa, SearXNG, DuckDuckGo) with recency and domain filters"
 readme = "SKILL.md"
 requires-python = ">=3.10"
